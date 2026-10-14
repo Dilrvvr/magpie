@@ -124,6 +124,8 @@ async function api(path, body, heads, signal) {
     // magpie has no models to connect an agent to yet: said in the
     // reader's language
     if (data?.code === "no_models") err.message = t("Add a provider or subscription in magpie first, then connect {agent}", { agent: data.agent });
+    // magpie has models, and none is left in the agent's model list (#1989)
+    if (data?.code === "all_hidden") err.message = t("None of magpie's models is left in {agent}'s model list: pick one under Model list → Pick, then connect {agent}", { agent: data.agent });
     if (data?.why) err.why = data.why; // a failed move's reason, said in the reader's language
     // an account the agent is signed in to, refused removal while it has
     // another: said in the reader's language
@@ -248,8 +250,11 @@ function keepIcons(...roots) {
 const maskLoads = new Map();
 let maskShelf = null;
 function maskSpan(src, failed) {
+  // a url() in a variable is read against the stylesheet that uses it,
+  // and a plugin's sits in its own folder: the picture named in full
+  const pic = `url("${new URL(src, document.baseURI).href}")`;
   const m = el("span", "mask");
-  m.style.setProperty("--i", `url(${src})`);
+  m.style.setProperty("--i", pic);
   let load = maskLoads.get(src);
   if (!load) {
     load = new Promise((done) => {
@@ -266,7 +271,7 @@ function maskSpan(src, failed) {
         document.body.append(maskShelf);
       }
       const k = el("span", "mask");
-      k.style.setProperty("--i", `url(${src})`);
+      k.style.setProperty("--i", pic);
       maskShelf.append(k);
     });
     maskLoads.set(src, load);
@@ -3840,12 +3845,11 @@ async function load(again) {
     // the library may have drawn itself before the saved language was known
     if (applyPrefs(state.settings, state.fx) || relang) {
       again = false; // the Usage page too is drawn again, in the new language
-      if (view === "library") window.loadLibrary?.();
       if (view === "plugins") window.loadPlugins?.();
-      if (view === "sessions") window.loadSessionsPage?.();
+      magpie.call(view, "relang"); // a plugin's page
     }
     // a Library drawn before the state came counted the hidden agents too
-    else if (view === "library" && hiddenIds().join() !== hid) window.redrawLibrary?.();
+    else if (view === "library" && hiddenIds().join() !== hid) magpie.call("library", "redraw");
     tintPanel();
     tintTitleBar();
     renderAgents();
@@ -7467,6 +7471,52 @@ function priceRateField() {
   box.oninput = () => { draft.priceRate = box.value; };
   return field(t("Price rate"), box, t("Costs are counted at the official price times this, as a relay bills, like 0.8 or 1.5; a price you set for a model stays as set"));
 }
+// pluginOptionsField: the switches a plugin declares for its provider
+// (auth.options, #2038, Vocllum), each an Off/On beside the plugin's own
+// words for it, put in as text. One the plugin asks to confirm is asked
+// before it is turned on. A change is kept in the draft as
+// pluginOptions[key] and saved with the provider; nothing runs when it is,
+// the plugin reads the value when it next wants it.
+function pluginOptionsField(sub) {
+  const opts = sub?.plugin?.options || [];
+  if (!opts.length) return [];
+  const now = (o) => (draft.pluginOptions && o.key in draft.pluginOptions ? draft.pluginOptions[o.key] : !!o.on);
+  const set = (o, on) => {
+    const own = { ...draft.pluginOptions };
+    if (on === !!o.on) delete own[o.key]; else own[o.key] = on;
+    if (Object.keys(own).length) draft.pluginOptions = own; else delete draft.pluginOptions;
+  };
+  const box = el("div", "stack plugin-options");
+  for (const o of opts) {
+    const row = el("div", "plugin-option");
+    row.dataset.key = o.key;
+    const text = el("div", "plugin-option-text");
+    text.append(el("div", "n", o.label));
+    if (o.description) text.append(el("div", "hint", o.description));
+    const draw = () => {
+      const seg = segs([["off", t("Off")], ["on", t("On")]], now(o) ? "on" : "off", async (v) => {
+        if (v === "on" && !now(o) && o.confirm && !(await confirmAction(t("Turn on {name}?", { name: o.label }), o.confirm, t("Turn on")))) {
+          seg.replaceWith(draw());
+          return;
+        }
+        set(o, v === "on");
+      });
+      return seg;
+    };
+    row.append(text, draw());
+    box.append(row);
+  }
+  return field(t("Plugin options"), box, t("{plugin} declares these and reads them as it works; nothing runs on its own when one changes.", { plugin: sub.plugin.name || sub.plugin.pid }));
+}
+// savePluginOptions saves the plugin options changed in the draft, by the
+// plugin's own provider id.
+async function savePluginOptions(sub) {
+  const pid = sub?.plugin?.pid;
+  if (!pid) return;
+  for (const [key, on] of Object.entries(draft.pluginOptions || {})) {
+    prefs = await writingPrefs(api("settings/plugin-option", { provider: pid, key, on }));
+  }
+}
 // priceRateOfDraft is the draft's rate as it is saved — null for none,
 // else the number — or undefined when what is typed isn't one.
 function priceRateOfDraft() {
@@ -8542,6 +8592,7 @@ function drawEditor(p, presetID) {
     ed.append(...concurrencyField(p));
     ed.append(...priceRateField());
     if (p.cline) ed.append(...upstreamField());
+    ed.append(...pluginOptionsField(subOf(a.agent)));
     // a plugin's provider is reached inside magpie: its plugin:// URLs go
     // nowhere to show or test
     const urls = [p.chat, p.responses, p.anthropic].filter(Boolean);
@@ -8577,7 +8628,9 @@ function drawEditor(p, presetID) {
       const priceRate = priceRateOfDraft();
       if (priceRate === undefined) return priceRateError(ed);
       if (priceTypedError(ed)) return;
-      saving(saveBtn, t("Saving…")); providerAction("save", { id: p.id, models: chosenIds(), noModels: noneChosen(), unlisted: draft.unlisted, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, proxy, accountProxies: own.map, maxConcurrency, ...queue, priceRate, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, ...routingOfDraft(p) }, t("{name} saved", { name: p.name })); };
+      const body = { id: p.id, models: chosenIds(), noModels: noneChosen(), unlisted: draft.unlisted, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, proxy, accountProxies: own.map, maxConcurrency, ...queue, priceRate, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, ...routingOfDraft(p) };
+      saving(saveBtn, t("Saving…"));
+      savePluginOptions(subOf(a.agent)).then(() => providerAction("save", body, t("{name} saved", { name: p.name })), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); }); };
     bar.append(cancel, saveBtn);
     ed.append(bar);
     return ed;
@@ -9035,7 +9088,7 @@ function drawEditor(p, presetID) {
     inner.append(...field(t("Models URL"), mu, t("Where the vendor lists its models, when that isn't under the base URL; asked with the key")));
     const cat = input(draft.catalog, t("models.dev ids, e.g. openai, deepseek"));
     cat.oninput = () => { draft.catalog = cat.value; };
-    inner.append(...field(t("Catalog"), cat, t("Display names and reasoning levels for the models; for a gateway that serves several vendors, list them all, first match wins")));
+    inner.append(...field(t("Catalog"), cat, t("Display names, reasoning levels and list prices for the models; for a gateway that serves several vendors, list them all, first match wins")));
     const bal = input(draft.balanceURL, "https://…/api/usage/token", "url");
     bal.classList.add("bal-url");
     bal.oninput = () => { draft.balanceURL = bal.value; balPath.placeholder = balanceFieldOf(bal.value); };
@@ -9206,7 +9259,7 @@ function contextsText(cx) {
 // (#120). The pick matching what is typed is lit.
 function contextPicks(p, cx) {
   const size = (n) => contextsText({ "*": n });
-  const picks = [128e3, 200e3, 256e3, 1e6].map((n) => ({ label: size(n).toUpperCase(), value: size(n) }));
+  const picks = [128e3, 200e3, 256e3, 400e3, 512e3, 1e6].map((n) => ({ label: size(n).toUpperCase(), value: size(n) }));
   // above the window its vendor says, not the one set here: a model set to
   // its most still offers it
   const big = (p?.models || []).filter((m) => m.max > ("listed" in m ? m.listed || 0 : m.context || 0));
@@ -10355,7 +10408,11 @@ function renderModels(p) {
       const levels = m.efforts || [];
       const savedKept = m.kept?.length || m.given ? m.kept || [] : levels;
       const nameNow = () => prefs[id]?.name ?? savedName;
-      const keptNow = () => prefs[id]?.efforts ? (prefs[id].efforts.length || m.given ? prefs[id].efforts : levels) : savedKept;
+      // none of its levels kept: it is sent no reasoning field at all
+      // (yuexian7 on Discord: a model models.dev says reasons answered
+      // reasoning_effort with 422, and worked without it)
+      const noneNow = () => prefs[id]?.reasonless ?? !!m.reasonless;
+      const keptNow = () => noneNow() ? [] : prefs[id]?.efforts ? (prefs[id].efforts.length || m.given ? prefs[id].efforts : levels) : savedKept;
       const imagesNow = () => prefs[id]?.ownImages ? !!m.ownImages : prefs[id]?.images ?? !!m.images;
       const row = el("div", "mname");
       const name = input(nameNow(), own);
@@ -10548,25 +10605,41 @@ function renderModels(p) {
         row.append(apiSeg);
       }
       // a model whose levels aren't known (m.given) can be given any
-      // of them, and none again
+      // of them, and none again;
+      // one whose levels are known can keep none of them: it is then
+      // sent no reasoning field, in a routing group too
       const boxes = [];
-      if (levels.length > 1) {
+      const noneSaid = el("span", "hint mnone", t("No reasoning field sent"));
+      noneSaid.title = t("None ticked: magpie sends {id} no reasoning field, whatever effort the agent asks, as for a model that doesn't reason", { id: m.id });
+      const drawNone = () => { noneSaid.hidden = !noneNow(); };
+      if (levels.length > 1 || levels.length && !m.given) {
         const lv = el("div", "mlevels");
-        lv.title = t(m.given ? "Its reasoning levels aren't known: tick the ones it takes" : "Reasoning levels agents are offered");
+        lv.title = t(m.given ? "Its reasoning levels aren't known: tick the ones it takes" : "Reasoning levels agents are offered; none ticked: it is sent no reasoning field");
         for (const l of levels) {
           const [tk, cb] = tick(t(l), keptNow().includes(l));
           cb.onchange = () => {
             const kept = keptNow();
             const next = levels.filter((x) => x === l ? cb.checked : kept.includes(x));
-            if (!next.length && !m.given) { cb.checked = true; status(t("Keep at least one level"), "err"); return; }
+            if (!next.length && !m.given) {
+              // none kept: no reasoning field
+              delete pref().efforts;
+              if (m.reasonless) delete pref().reasonless; else pref().reasonless = true;
+              drawNone();
+              drawReset();
+              return;
+            }
+            if (m.reasonless) pref().reasonless = false; else delete pref().reasonless;
             const all = next.length === levels.length && !m.given;
             if (all ? !m.kept?.length : next.join() === savedKept.join()) delete pref().efforts;
             else pref().efforts = all ? [] : next;
+            drawNone();
             drawReset();
           };
           boxes.push([l, cb]);
           lv.append(tk);
         }
+        lv.append(noneSaid);
+        drawNone();
         row.append(lv);
       }
       // what the Save will make of it differs from what it is: said beside
@@ -10580,10 +10653,12 @@ function renderModels(p) {
         if (draft.priceTyped) delete draft.priceTyped[id];
         if (m.default) prefs[id].name = "";
         if (m.kept?.length) prefs[id].efforts = [];
+        if (m.reasonless) prefs[id].reasonless = false;
         if (m.imageSet) prefs[id].ownImages = true;
         name.value = nameNow();
         imgCb.checked = imagesNow();
         for (const [l, cb] of boxes) cb.checked = keptNow().includes(l);
+        drawNone();
         if (m.api) prefs[id].api = "";
         if (m.same) prefs[id].same = "";
         same.value = sameNow();
@@ -10598,7 +10673,7 @@ function renderModels(p) {
         unsaved.hidden = !prefs[id] && !draft.priceTyped?.[id];
         // staged back to its own already, there is nothing to restore
         const images = prefs[id]?.ownImages ? false : prefs[id]?.images !== undefined ? prefs[id].images !== !!m.ownImages : !!m.imageSet;
-        const custom = nameNow() !== "" || (prefs[id]?.efforts ? prefs[id].efforts.length > 0 : !!m.kept?.length) || images || apiNow() !== "" || sameNow() !== "" || priceNow() !== null || !!draft.priceTyped?.[id];
+        const custom = nameNow() !== "" || noneNow() || (prefs[id]?.efforts ? prefs[id].efforts.length > 0 : !!m.kept?.length) || images || apiNow() !== "" || sameNow() !== "" || priceNow() !== null || !!draft.priceTyped?.[id];
         reset.hidden = !custom;
       };
       row.append(unsaved, reset);
@@ -11194,7 +11269,11 @@ async function followSignIn(id) {
     if (signing?.id !== id) continue;
     if (st.state === "waiting" || st.state === "installing") {
       // the CLI it needed is in: now the vendor's page can open
-      if (signing.state === "installing" && st.state === "waiting" && st.url) api("open", { url: st.url }).catch(() => {});
+      if (signing.state === "installing" && st.state === "waiting" && st.url) {
+        api("open", { url: st.url }).catch((e) => {
+          if (signing?.id === id) { signing = { ...signing, openError: e.message }; renderProviders(); }
+        });
+      }
       if (signing.state !== st.state || signing.url !== st.url || signing.code !== st.code) { signing = { ...st, ...signingKept() }; renderProviders(); }
       continue;
     }
@@ -11209,7 +11288,7 @@ async function followSignIn(id) {
 // again and a proxy picked for it — its site and way, the account signed
 // in to again, the proxy picked
 function signingKept() {
-  return { site: signing.site, method: signing.method, inputs: signing.inputs, forUser: signing.forUser, picked: signing.picked, askProxy: signing.askProxy, customProxy: signing.customProxy };
+  return { site: signing.site, method: signing.method, inputs: signing.inputs, forUser: signing.forUser, picked: signing.picked, askProxy: signing.askProxy, customProxy: signing.customProxy, openError: signing.openError };
 }
 
 // signInProxyOf: the proxy an account's sign-in goes through when none is
@@ -11708,6 +11787,7 @@ function renderSigning(sub) {
   }
   tt.append(el("span", "n", t("Finish signing in to {name} in your browser", { name: sub.name })),
     el("span", "s", signing.state === "starting" ? t("Starting the sign-in…")
+      : signing.openError ? t("magpie couldn't open your browser: {error}. Open the sign-in link below in a browser yourself.", { error: signing.openError })
       : sub.plugin ? (signing.instructions || (signing.pasteCode ? t("magpie opened the sign-in page. Paste the code it shows below.") : t("magpie opened the sign-in page. The account shows up here as soon as you're done.")))
       : signing.pasteCode ? t("magpie opened the sign-in page. Paste the code it shows below.")
       : signing.code && sub.agent === "factory" ? t("magpie opened Factory's sign-in page. Check it shows this code and confirm it; the account shows up here as soon as you're done.")
@@ -11730,7 +11810,15 @@ function renderSigning(sub) {
     tt.append(link);
     const acts = el("span", "acts");
     const open = el("button", "link", t("Open again"));
-    open.onclick = () => api("open", { url: signing.url }).catch(() => {});
+    // one that fails says why, where "magpie opened the sign-in page" was (#2043)
+    // a poll may have put a fresh copy of the same sign-in in its place
+    const flow = signing;
+    const same = () => signing && signing.id === flow.id && signing.agent === flow.agent;
+    open.onclick = () => api("open", { url: flow.url }).then(() => {
+      if (same() && signing.openError) { signing = { ...signing, openError: "" }; renderProviders(); }
+    }, (e) => {
+      if (same()) { signing = { ...signing, openError: e.message }; renderProviders(); }
+    });
     acts.append(open);
     const ghe = copilotHostSwitch(sub);
     if (ghe) acts.append(ghe);
@@ -14211,7 +14299,7 @@ function loadQuotas(asked, again) {
   if (!again) quotasTries = 0;
   let reading = false, same = false;
   const p = Promise.resolve(quotasLoading).catch(() => {})
-    .then(() => Promise.all([api("usage/quotas" + (asked ? "?asked=1" : ""), undefined, (h) => { reading = h.get("X-Magpie-Reading") === "1"; }), api("usage/quotas/history?days=35").catch(() => null)]))
+    .then(() => Promise.all([api("usage/quotas" + (asked ? "?asked=1" : ""), undefined, (h) => { reading = h.get("X-Magpie-Reading") === "1"; }), api("usage/quotas/history?days=45").catch(() => null)]))
     .then(([q, h]) => {
       // an answer that isn't a list of cards is a read that failed: what
       // was read before stays, as it does when the read is refused
@@ -14617,8 +14705,10 @@ function renderQuotas() {
       if (folded.has(sub)) continue;
       // "Every model" by the account, or the card's name: where the click
       // was, whichever way the meters under it grow or shrink
-      const [meters, every] = familyQuota(sub);
       const brief = several && !usageAcctOpen(sub, subs);
+      const history = !brief && quotaHistoryView(sub);
+      const shownSub = history ? quotaHistoryCard(sub, history) : sub;
+      const [meters, every] = history ? [quotaWindows(shownSub), null] : familyQuota(sub);
       if (sub.user) {
         const who = el("div", "subscription-account" + (brief ? " brief" : ""));
         who.dataset.card = trayCardID(sub);
@@ -14637,31 +14727,31 @@ function renderQuotas() {
       if (brief) meters.classList.add("brief");
       card.append(meters);
       // a remote magpie's gateway key: what its windows don't say (#1547)
-      const keyLine = !brief && keyLimitLine(sub);
+      const keyLine = !brief && !history && keyLimitLine(sub);
       if (keyLine) card.append(keyLine);
       // how many of the period's requests to it magpie made itself (#1839)
-      const own = !brief && ownLine(sub);
+      const own = !brief && !history && ownLine(sub);
       if (own) card.append(own);
       // WorkBuddy's, Trae CN's or MiniMax Code's daily check-in, how this account's went,
       // and the switch for it, on the card rather than only in Settings
       // (#694); the switch on the first card of each vendor's
-      if (sub.checkins) card.append(checkinRow(sub, sub === subs.find((x) => x.checkins && (x.checkinBy || "") === (sub.checkinBy || "")), subs));
+      if (sub.checkins && !history) card.append(checkinRow(sub, sub === subs.find((x) => x.checkins && (x.checkinBy || "") === (sub.checkinBy || "")), subs));
       // what was left over time, against an even burn (#651)
       const curve = !brief && !sub.error && quotaCurve(sub);
       if (curve) card.append(curve);
       // WorkBuddy's credits, day by day, as magpie counted them (#568)
-      if (!brief && sub.daily && !sub.error) card.append(creditDays(sub));
+      if (!brief && !history && sub.daily && !sub.error) card.append(creditDays(sub));
       // what is left besides the windows, under them
-      if (sub.balance && sub.windows?.length && !sub.error) card.append(balanceRow(sub, "What is left on the account besides its windows", false));
+      if (!history && sub.balance && sub.windows?.length && !sub.error) card.append(balanceRow(sub, "What is left on the account besides its windows", false));
       // the balance over time, and when it runs out at that pace
-      const spend = !brief && !sub.error && balanceCurve(sub);
+      const spend = !brief && !history && !sub.error && balanceCurve(sub);
       if (spend) card.append(spend);
       // when the windows were read: "Updated 3 min ago", or the time of
       // ones standing in for a reading that failed just now (#802; a
       // balance alone says it in its row)
-      const read = !brief && sub.windows?.length && !sub.error && readWhen(sub, true);
+      const read = !brief && sub.windows?.length && !sub.error && readWhen(shownSub, true);
       if (read) card.append(read);
-      if (!brief && sub.resets?.count) {
+      if (!brief && !history && sub.resets?.count) {
         const r = el("div", "quota-resets");
         r.append(resetsWords(sub.resets, sub));
         // only Codex's are spent from here: a GLM team's are spent on
@@ -14675,10 +14765,10 @@ function renderQuotas() {
         card.append(r);
       }
       // the account's standing say on its resets, held or not (#719)
-      const policy = !brief && autoResetRow(sub, "quota-autoreset");
+      const policy = !brief && !history && autoResetRow(sub, "quota-autoreset");
       if (policy) card.append(policy);
       // and on its credits, when its windows run out
-      const credits = !brief && creditsRow(sub, "quota-credits");
+      const credits = !brief && !history && creditsRow(sub, "quota-credits");
       if (credits) card.append(credits);
     }
     // in the card's head, beside its name: no line of its own
@@ -15073,6 +15163,7 @@ function creditDays(sub) {
 // a dashed line from the window's start to its reset is an even burn, and
 // a thin upright one is now. "2 days" is the last two days; "Cycle" the
 // current cycle of the account's longest window, its start to its reset;
+// each account can pick an earlier recorded cycle beside its plot.
 // "Off" draws none, on the Usage page or on the tray's cards (ARNO on
 // Discord: 额度面板变得非常混乱和难以观看了). One pick in the allowances'
 // head turns every card, remembered, and the tray panel follows it.
@@ -15131,7 +15222,73 @@ function quotaCycleBreak(a, b) {
   if (a.reset == null || b.reset == null) return true;
   if (a.reset <= b.at) return true;
   const moved = b.reset - a.reset, slack = 5 * 60e3;
+  const rolling = moved > 0 && Math.abs(moved - (b.at - a.at)) <= slack;
+  if (!rolling && Math.abs(moved) <= slack && b.left > a.left + 5) return true;
   return moved > b.at - a.at + slack || moved < -slack;
+}
+// Recorded cycles, never weeks counted back from today's deadline. An
+// early reset ends the preceding cycle at the first observed new reading
+// unless the vendor's new start fits between those readings.
+function quotaRecordedCycles(l) {
+  const cycles = [];
+  for (const p of l.points) {
+    let c = cycles[cycles.length - 1];
+    const prev = c?.points[c.points.length - 1];
+    if (!prev || quotaCycleBreak(prev, p)) {
+      let start = p.start ?? p.at;
+      if (prev && (prev.reset == null || prev.reset > p.at) && !(start > prev.at && start <= p.at)) start = p.at;
+      if (prev?.reset != null && prev.reset <= p.at) start = Math.max(start, prev.reset);
+      if (c) c.end = Math.min(c.end, start);
+      c = { id: String(p.at), start, end: p.reset ?? p.at, points: [] };
+      cycles.push(c);
+    }
+    c.points.push(p);
+    c.end = p.reset ?? p.at;
+  }
+  return cycles;
+}
+// The longest recorded window owns the cycle picker (usually a week).
+// Shorter windows still draw, with their own reset breaks, in that range.
+function quotaPastCycles(lines, now) {
+  const longest = lines.reduce((a, b) => {
+    const span = (l) => Math.max(...l.points.map((p) => p.reset != null && p.start != null ? p.reset - p.start : 0));
+    return span(b) > span(a) ? b : a;
+  });
+  return { line: longest, cycles: quotaRecordedCycles(longest).filter((c, i, all) => i < all.length - 1 || c.end <= now).reverse() };
+}
+const quotaCyclePicks = new Map(); // account -> recorded cycle's first reading
+// One selection drives both the meters and the curve. A snapshot contains
+// only the fields history actually kept, never today's counts or holds.
+function quotaHistoryView(sub, lines = quotaLines(sub), now = Date.now()) {
+  if (quotaRange !== "cycle" || sub.error || !lines.length) return null;
+  const past = quotaPastCycles(lines, now);
+  const picked = past.cycles.find((c) => c.id === quotaCyclePicks.get(usageAcctKey(sub)));
+  if (!picked) return null;
+  const shown = lines.map((l) => {
+    const points = l === past.line ? picked.points : l.points.filter((p) => p.at >= picked.start && p.at < picked.end);
+    const last = points.at(-1);
+    return { ...l, points, cycle: l === past.line ? { start: picked.start, reset: picked.end } : last ? { start: last.start ?? points[0].at, reset: last.reset } : {} };
+  });
+  return { picked, shown };
+}
+function quotaHistoryCard(sub, { picked, shown }) {
+  const windows = familyWindows(sub.windows).map((w) => {
+    const name = w.pool ? w.pool + " · " + w.name : w.name;
+    const last = shown.find((l) => l.name === name)?.points.at(-1);
+    const base = { name: w.name, pool: w.pool, historyMissing: !last };
+    if (!last) return base;
+    return { ...base, used: 100 - last.left, recordedAt: last.at,
+      resetsAt: new Date(Math.min(last.reset ?? picked.end, picked.end)).toISOString() };
+  });
+  const at = Math.max(...windows.filter((w) => !w.historyMissing).map((w) => w.recordedAt));
+  return { ...sub, windows, history: true, asOf: null, readAt: Number.isFinite(at) ? new Date(at).toISOString() : null };
+}
+function quotaCycleLength(c) {
+  let minutes = Math.max(1, Math.round((c.end - c.start) / 60e3));
+  const days = Math.floor(minutes / 1440); minutes %= 1440;
+  const hours = Math.floor(minutes / 60); minutes %= 60;
+  return [[days, "day"], [hours, "hour"], [minutes, "minute"]].filter(([n]) => n).map(([n, unit]) =>
+    new Intl.NumberFormat(intlLang(), { style: "unit", unit, unitDisplay: "short" }).format(n)).join(" ");
 }
 // the current cycle of a line: its start and its reset, the window's as
 // the card has it, else its last reading's
@@ -15144,6 +15301,7 @@ function quotaCycle(l, now) {
     while (i > 0 && !quotaCycleBreak(l.points[i - 1], l.points[i])) i--;
     start = l.points[i].at;
   }
+  if (reset === last.reset) start = Math.max(start, quotaRecordedCycles(l).at(-1).start);
   if (reset != null && reset <= now) reset = null;
   return { start: Math.min(start, now), reset };
 }
@@ -15183,6 +15341,11 @@ function quotaTimeText(at, now) {
   const time = d.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit", hour12: false });
   return sameDay ? time : d.toLocaleDateString(lang, { month: "short", day: "numeric" }) + " " + time;
 }
+// A completed cycle can end today; still say both dates in its menu and
+// axis, so a multi-day cycle doesn't read as two times on the first day.
+function quotaCycleDate(at) {
+  return new Date(at).toLocaleString(intlLang(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+}
 // drawQuotaPlot puts lines' curves for [x0, x1] in svg, a w×h box:
 // the grid, the even burns, the lines, and now.
 function drawQuotaPlot(g, lines, x0, x1, w, h, now, thin) {
@@ -15191,7 +15354,7 @@ function drawQuotaPlot(g, lines, x0, x1, w, h, now, thin) {
   const X = (t) => ((t - x0) / (x1 - x0)) * w;
   lines.forEach((l, i) => {
     const color = `var(--c${(i % 7) + 1})`;
-    const c = quotaCycle(l, now);
+    const c = l.cycle || quotaCycle(l, now);
     // a window far shorter than the span (a 5-hour one over a week) is
     // drawn faint, without its even burn, an all but upright dash
     const short = !thin && c.reset && c.reset - c.start < (x1 - x0) / 12;
@@ -15214,7 +15377,9 @@ function quotaCurve(sub) {
   if (!lines.length) return null;
   const box = el("div", "quota-curve");
   const head = el("div", "qc-head");
-  const range = el("span", "qc-range");
+  const range = el("button", "text qc-range");
+  range.type = "button";
+  const key = usageAcctKey(sub);
   head.append(el("span", "", t("Left over time")), range);
   // what the dashes are isn't plain from the plot (John on Discord asked)
   box.title = t("Solid: what was left. Dashed: an even pace, full at the cycle's start to empty at its reset; a line above its dashes lasts the cycle, one below runs out before the reset.");
@@ -15223,24 +15388,46 @@ function quotaCurve(sub) {
   curveZoom(box, g);
   const axis = el("div", "qc-axis");
   const legend = el("div", "qc-legend");
-  lines.forEach((l, i) => {
-    const k = el("span", "qc-key");
-    const sw = el("i");
-    sw.style.background = `var(--c${(i % 7) + 1})`;
-    const last = l.points[l.points.length - 1];
-    k.append(sw, el("span", "", l.label), el("b", "", Math.round(last.left) + "%"));
-    k.title = [t("{name}: {n} left, read {when}", { name: l.label, n: Math.round(last.left) + "%", when: quotaTimeText(last.at, Date.now()) }),
-      "", t("Latest readings:"), ...quotaReadings(l, Date.now())].join("\n");
-    legend.append(k);
-  });
+  const drawLegend = (shown, now) => {
+    legend.replaceChildren();
+    shown.forEach((l, i) => {
+      const k = el("span", "qc-key");
+      const sw = el("i");
+      sw.style.background = `var(--c${(i % 7) + 1})`;
+      const last = l.points[l.points.length - 1];
+      if (!last) return;
+      k.append(sw, el("span", "", l.label), el("b", "", Math.round(last.left) + "%"));
+      k.title = [t("{name}: {n} left, read {when}", { name: l.label, n: Math.round(last.left) + "%", when: quotaTimeText(last.at, now) }),
+        "", t("Latest readings:"), ...quotaReadings(l, now)].join("\n");
+      legend.append(k);
+    });
+  };
   box.draw = () => {
     const now = Date.now();
-    const [x0, x1] = quotaSpan(lines, quotaRange, now);
-    drawQuotaPlot(g, lines, x0, x1, W, H, now);
-    const r = t(quotaRange === "2d" ? "2 days" : "Cycle");
+    const past = quotaPastCycles(lines, now);
+    const history = quotaHistoryView(sub, lines, now);
+    const picked = history?.picked;
+    const [x0, x1] = picked ? [picked.start, picked.end] : quotaSpan(lines, quotaRange, now);
+    // Keep only readings of the selected cycle. In particular, a refill
+    // at its end belongs to the next cycle, not this cycle's last figure.
+    const shown = history?.shown || lines;
+    drawQuotaPlot(g, shown, x0, Math.max(x0 + 1, x1), W, H, now);
+    const r = picked ? t("Past cycle") : t(quotaRange === "2d" ? "2 days" : "Cycle");
     range.textContent = r;
+    range.disabled = quotaRange !== "cycle" || !past.cycles.length;
+    range.title = t("Choose a recorded cycle");
+    range.setAttribute("aria-label", t("Choose a recorded cycle"));
+    if (!range.disabled) range.append(svg(CHEV, 9, 1.6));
+    range.onclick = (e) => {
+      e.stopPropagation();
+      if (range.classList.contains("open")) return closeProtoMenu();
+      openProtoMenu(range, [{ v: "", name: "Cycle", note: "The current cycle, from the window's start to its reset" }, ...past.cycles.map((c) => ({
+        v: c.id, name: quotaCycleDate(c.start) + " – " + quotaCycleDate(c.end), literalName: true, note: t("Recorded duration: {duration}", { duration: quotaCycleLength(c) }),
+      }))], picked?.id || "", (id) => { if (id) quotaCyclePicks.set(key, id); else quotaCyclePicks.delete(key); renderQuotas(); }, "Choose a recorded cycle", "sess-menu");
+    };
     g.setAttribute("aria-label", t("Left over time") + " · " + r);
-    axis.replaceChildren(el("span", "", quotaTimeText(x0, now)), el("span", "", quotaTimeText(x1, now)));
+    axis.replaceChildren(el("span", "", picked ? quotaCycleDate(x0) : quotaTimeText(x0, now)), el("span", "", picked ? quotaCycleDate(x1) : quotaTimeText(x1, now)));
+    drawLegend(shown, now);
   };
   box.append(head, g, axis, legend);
   box.draw();
@@ -15248,8 +15435,7 @@ function quotaCurve(sub) {
 }
 // quotaReadings: a line's last eight readings, newest first, each what was
 // left and when it was read (#802), a line each, ↻ where the window
-// started again; for its legend key's title, the card keeping no control
-// of its own
+// started again; for its legend key's title
 function quotaReadings(l, now) {
   const pts = l.points.slice(-8);
   return pts.map((p, i) => (i > 0 && quotaCycleBreak(pts[i - 1], p) ? "↻ " : "") + Math.round(p.left) + "% · " + quotaTimeText(p.at, now)).reverse();
@@ -15342,13 +15528,10 @@ function balanceCurve(sub) {
 }
 function setQuotaRange(id) {
   if (id === quotaRange) return;
-  const was = quotaRange;
   quotaRange = id;
   try { localStorage.setItem("magpie.quotaRange", id); } catch {}
-  // turned on or off, the cards are made again; a range redraws them
-  if (was === "off" || id === "off") return renderQuotas();
-  renderQuotaTrend();
-  for (const b of document.querySelectorAll(".quota-curve")) b.draw?.();
+  // A range also restores today's meters when leaving a historical cycle.
+  renderQuotas();
 }
 // quotaSpark: the tray card's thin line of a window's current cycle, the
 // even burn faint under it; none while the curves are off
@@ -16627,7 +16810,9 @@ function balanceMeter(percent) {
 // refresh is left of it.
 function readWhen(q, refresh = false) {
   let s;
-  if (q.asOf) {
+  if (q.history && q.readAt) {
+    s = el("div", "quota-read", t("Last reading {when}", { when: quotaCycleDate(Date.parse(q.readAt)) }));
+  } else if (q.asOf) {
     s = el("div", "quota-read stale", asOfText(q));
     s.title = asOfText(q);
   } else if (q.readAt) {
@@ -16782,15 +16967,18 @@ function quotaWindows(sub) {
     // the count and its share in parts, so a count too long for its
     // window's width goes to a second line at the · rather than cut short
     const n = el("button", "quota-n");
-    const [count, share] = quotaText(w).split(" · ");
+    const text = w.historyMissing ? t("No readings in this cycle") : quotaText(w);
+    const [count, share] = text.split(" · ");
     n.append(el("span", "", share ? count + " ·" : count));
     if (share) n.append(" ", el("span", "", share));
-    n.title = quotaText(w) + "\n" + t(quotaLeft ? "Show how much of each window is used" : "Show how much of each window is left");
+    n.title = w.historyMissing ? text : text + "\n" + t(quotaLeft ? "Show how much of each window is used" : "Show how much of each window is left");
+    n.disabled = !!w.historyMissing;
     n.onclick = () => setQuotaLeft(!quotaLeft);
     labels.append(el("span", "", t(w.name)), n);
     const track = el("div", "quota-track");
     const fill = el("i");
-    fill.style.width = `${quotaFill(w)}%`;
+    fill.style.width = w.historyMissing ? "0%" : `${quotaFill(w)}%`;
+    if (w.historyMissing) track.style.visibility = "hidden";
     track.append(fill);
     quota.append(labels);
     if (!w.unlimited) quota.append(track);
@@ -16799,10 +16987,10 @@ function quotaWindows(sub) {
     if (w.resetsAt) {
       const at = new Date(w.resetsAt);
       r = el("div", "quota-reset");
-      r.append(el("span", "", resetText(at) + (at > Date.now() ? " ·" : "")));
-      if (at > Date.now()) r.append(" ", el("span", "", untilText(at)));
+      r.append(el("span", "", sub.history ? t("Cycle ended {when}", { when: quotaCycleDate(+at) }) : resetText(at) + (at > Date.now() ? " ·" : "")));
+      if (!sub.history && at > Date.now()) r.append(" ", el("span", "", untilText(at)));
       quota.append(r);
-      quota.title = resetText(at, at.toLocaleString(intlLang()));
+      quota.title = sub.history ? t("Last reading {when}", { when: quotaCycleDate(w.recordedAt) }) : resetText(at, at.toLocaleString(intlLang()));
     }
     // credits that run out before then, or with no reset at all
     const out = runsOutText(w);
@@ -19964,7 +20152,7 @@ function sessionItem(s) {
   const open = (e) => {
     if (window.getSelection()?.toString()) return;
     if (featuresOff.has("sessions")) return; // Sessions is switched off: there is no page to open it on
-    window.openSessionOnPage?.(s, e);
+    magpie.call("sessions", "reveal", s, e);
   };
   r.onclick = open;
   r.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(e); } };
@@ -20019,7 +20207,7 @@ function viaText(v) {
 }
 
 // All sessions: the Sessions page, on the agent picked here if one is
-$("#sessAll").onclick = (e) => window.openSessionOnPage?.(sessAgent === "all" ? {} : { agent: sessAgent }, e);
+$("#sessAll").onclick = (e) => magpie.call("sessions", "reveal", sessAgent === "all" ? {} : { agent: sessAgent }, e);
 $("#sessQ").oninput = (e) => { sessQuery = e.target.value; if (sessions) renderSessions(); };
 $("#sessQ").onkeydown = (e) => { if (e.key === "Escape" && e.target.value) { e.stopPropagation(); e.target.value = ""; sessQuery = ""; if (sessions) renderSessions(); } };
 
@@ -22286,6 +22474,7 @@ function renderSearch(s, keep) {
     }
     const r = row(`${n + 1}. ${a.name}`, what, ...tools);
     r.classList.add("search-api");
+    if (a.keys > 1 || a.quota) searchKeysRow(s, a, row, set);
   });
   // which goes first when both a provider and a search API can search
   // (#928); with only one of them there is nothing to choose
@@ -22301,6 +22490,70 @@ function renderSearch(s, keep) {
   const mcp = row(t("MCP server"), t("Cursor, Claude Desktop and other agents can add this search as an MCP server (Streamable HTTP) with one web_search tool. From another computer, send a gateway key as Authorization: Bearer <key>."),
     el("code", "", mcpURL), copyBtn(mcpURL, t("Address")));
   mcp.id = "searchMcpRow";
+}
+
+// searchKeysRow: under a search API with several keys, or one whose keys
+// quota magpie can read (Tavily's), a row of its keys (SlouchyQuill on
+// Discord): how a search picks among them, in turn (the default) or in
+// order, and what each has used of its limit, read once as the page is
+// drawn and again on Check again. A read that fails says unknown and why,
+// never 0; a key a search set aside lately says why and until when.
+const searchQuotaSeen = {};
+function searchKeysRow(s, a, row, set) {
+  const tools = [];
+  if (a.keys > 1) tools.push(segs([["", t("In turn")], ["order", t("In order")]], a.pick || "",
+    (v) => set({ vendor: a.vendor, pick: v || "turns" })));
+  const mine = el("div", "search-quota");
+  const seenAs = [a.key, a.url].join(" ");
+  const ask = (fresh) => {
+    searchQuotaSeen[a.vendor] = { as: seenAs, loading: true };
+    draw();
+    api("settings/search-quota", { vendor: a.vendor, fresh })
+      .then((r) => { searchQuotaSeen[a.vendor] = { as: seenAs, keys: r.keys || [] }; })
+      .catch((e) => { searchQuotaSeen[a.vendor] = { as: seenAs, err: e.message }; })
+      .finally(draw);
+  };
+  // the list in the page now: Settings may have been drawn again while
+  // the read was out
+  const draw = () => {
+    const list = document.querySelector(`.search-keys[data-vendor="${a.vendor}"] .search-quota`) || mine;
+    const seen = searchQuotaSeen[a.vendor];
+    list.replaceChildren();
+    if (!seen || seen.loading) return list.append(el("div", "faint", t("Reading what each key has used…")));
+    if (seen.err) return list.append(el("div", "err", t("Unknown: {why}", { why: seen.err })));
+    const num = (n) => Number(n).toLocaleString(intlLang());
+    for (const q of seen.keys) {
+      const line = el("div", "quota-key");
+      const said = !q.known ? t("Unknown: {why}", { why: q.err || "" })
+        : q.unlimited ? t("{used} used, no limit", { used: num(q.used) })
+        : t("{used} of {limit} used", { used: num(q.used), limit: num(q.limit) });
+      const notes = [];
+      if (q.known && q.of === "plan") notes.push(q.plan ? t("{plan} plan, shared by its account's keys", { plan: q.plan }) : t("the plan's, shared by its account's keys"));
+      if (q.paygoLeft > 0) notes.push(t("{n} pay-as-you-go left", { n: num(q.paygoLeft) }));
+      if (q.resting) notes.push(t("asked last until {time}: {why}", { time: new Date(q.restUntil).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }),
+        why: { "turned away": t("turned away"), "out of credit": t("out of credit"), "rate limited": t("rate limited"), "used up": t("used up") }[q.resting] || q.resting }));
+      const used = el("span", q.known ? (q.usedUp ? "used warn" : "used") : "used err", said);
+      line.append(el("code", "", q.key), used);
+      if (q.usedUp) line.append(el("span", "warn", t("used up")));
+      if (notes.length) line.append(el("span", "faint", notes.join(" · ")));
+      list.append(line);
+    }
+  };
+  if (a.quota) {
+    const again = el("button", "text search-quota-again", t("Check again"));
+    again.onclick = () => ask(true);
+    tools.push(again);
+  }
+  const r = row(t("Keys of {name}", { name: a.name }),
+    a.keys > 1 ? t("In turn spreads searches over the keys; in order uses the first until it is refused. A key refused lately is asked last.") : t("What the key has used of its limit"),
+    ...tools);
+  r.classList.add("search-keys");
+  r.dataset.vendor = a.vendor;
+  if (a.quota) {
+    r.querySelector(".who").append(mine);
+    if (searchQuotaSeen[a.vendor]?.as !== seenAs) ask(false);
+    else draw();
+  }
 }
 
 // renderSearcher: the provider that searches the web for a model that
@@ -22943,10 +23196,15 @@ function renderCORS(s) {
 // each to take it away. None listed lets every address in, with a gateway
 // key, as before; this computer is always let in. MAGPIE_ALLOW_IPS, where
 // set, is the list, shown and not edited here.
-let allowDraft = { value: "", err: "" };
+// A list that would shut out the page saving it names the address magpie
+// sees the page from (Mathresearcher on Discord: which address?), and
+// offers to add it to the list that was refused; behind Docker or a proxy
+// that is the proxy's, not the user's computer's (gateway.peerAddr).
+let allowDraft = { value: "", err: "", addr: "", tried: null };
 function allowSays(m) {
   if (/is not an IP address/.test(m)) return t("Write an address as 203.0.113.7, or a range as 10.0.0.0/8 or 2001:db8::/32");
-  if (/shut out/.test(m)) return t("That list leaves out the address this page is open from: add it first, or this page can’t reach magpie");
+  const out = /shut out (\S+), the address/.exec(m);
+  if (out) return t("That list leaves out {addr}, the address magpie sees this page open from: add it first, or this page can’t reach magpie", { addr: out[1] });
   if (/MAGPIE_ALLOW_IPS/.test(m)) return t("MAGPIE_ALLOW_IPS sets this list; change it there");
   return t(m);
 }
@@ -22958,13 +23216,28 @@ function renderAllow(s) {
   const list = env ? (s.allowIPsFromEnv || []) : (s.allowIPs || []);
   const d = allowDraft;
   const set = (next, done) => writingPrefs(api("settings/allowips", { ips: next }))
-    .then((ns) => { prefs = ns; d.err = ""; done?.(); renderSettings(); status(t("Saved"), "ok", 1500); })
-    .catch((e) => { d.err = allowSays(e.message); status(d.err, "err"); renderSettings(); });
+    .then((ns) => { prefs = ns; d.err = d.addr = ""; d.tried = null; done?.(); renderSettings(); status(t("Saved"), "ok", 1500); })
+    .catch((e) => {
+      d.err = allowSays(e.message);
+      d.addr = /shut out (\S+), the address/.exec(e.message)?.[1] || "";
+      d.tried = d.addr ? { next, done } : null;
+      status(d.err, "err"); renderSettings();
+    });
   const r = el("div", "row pref rule-row");
   const who = el("div", "who");
   const sub = d.err || (env ? t("Set by MAGPIE_ALLOW_IPS. Other computers reach magpie only from these addresses, even with a gateway key; this computer always can")
     : t("Other computers reach magpie only from these addresses or ranges (CIDR), even with a gateway key; this computer always can. None listed lets every address in"));
   who.append(el("div", "name", t("Allowed addresses")), el("div", "sub" + (d.err ? " err" : ""), sub));
+  // the address the refusal named, added to the list that was refused in
+  // one click
+  if (d.err && d.addr && d.tried && !env) {
+    const fix = el("button", "text allow-fix", t("Add {addr}", { addr: d.addr }));
+    fix.type = "button";
+    fix.title = t("Behind Docker or a reverse proxy, this is the proxy’s address, not your computer’s: adding it lets in everyone who comes through that proxy");
+    const { next, done } = d.tried;
+    fix.onclick = () => set([...next, d.addr], done);
+    who.append(fix);
+  }
   r.append(who);
   if (!env) {
     const field = input(d.value, "203.0.113.7, 10.0.0.0/8");
@@ -23750,21 +24023,21 @@ async function show(v) {
       if (!await cancelEdit(true)) return false;
     } else if (!$("#modal").hidden && !$("#modal").classList.contains("out")) {
       if (view === "library" && modalFormDirty() && !(await confirmDiscard())) return false;
-      if (view === "library") window.closeLibraryModal?.(); else closeModal();
+      if (view === "library") magpie.call("library", "close"); else closeModal();
     }
     if (view === "routing" && window.routingDirty?.()) {
       if (!(await confirmDiscard())) return false;
       window.discardRouting?.();
     }
-    if (view === "library" && window.libraryDirty?.()) {
+    if (view === "library" && magpie.call("library", "dirty")) {
       if (!(await confirmDiscard())) return false;
-      window.discardLibrary?.();
+      magpie.call("library", "discard");
     }
   }
   view = v;
   // the page the reader leaves is the one the window opens on next (keptView)
   if (mode === "window") { try { localStorage.setItem("magpie.lastView", v); } catch { /* not kept */ } }
-  const title = ({ agents: "Agents", providers: "Providers", gateway: "Gateway", routing: "Routing", usage: "Usage", sessions: "Sessions", library: "Library", plugins: "Plugins", settings: "Settings" })[v];
+  const title = magpie.page(v)?.title ?? ({ agents: "Agents", providers: "Providers", routing: "Routing", usage: "Usage", plugins: "Plugins", settings: "Settings" })[v];
   $("#pageTitle").dataset.en = title;
   $("#pageTitle").textContent = t(title);
   if (mode === "window") {
@@ -23778,23 +24051,22 @@ async function show(v) {
   $("#prefs").classList.toggle("on", v === "settings");
   if (v === "settings") $("#prefs").setAttribute("aria-current", "page"); else $("#prefs").removeAttribute("aria-current");
   navSubs();
-  for (const id of ["agents", "providers", "routing", "usage", "sessions", "library", "plugins", "settings", ...magpie.pages()]) $("#view-" + id).hidden = v !== id;
+  for (const id of ["agents", "providers", "routing", "usage", "plugins", "settings", ...magpie.pages()]) $("#view-" + id).hidden = v !== id;
   // back to where the reader was in it, and again once it has what it loads
   const back = () => backToReader($("#view-" + v));
   requestAnimationFrame(back);
   closePicker();
   closeAgentModels();
   if (v !== "providers" && editing !== null) cancelEdit(true);
-  magpie.call(v, "open");
+  // a plugin's page loads what it shows; back once it has
+  magpie.call(v, "open")?.then?.(back);
   if (v === "providers" || v === "routing" || providersPage(v)) loadProviders().then(back, (e) => status(e.message, "err"));
   // Routing's accounts show their windows as the Usage page read them
   // (#1833): what is kept, read in an ordinary way, never an asked read
   if (v === "routing" && (!quotas || Date.now() - quotasAt > 60e3)) loadQuotas();
   if (v === "usage") loadUsage(true).then(back, (e) => status(e.message, "err"));
   if (v === "settings") loadSettings().then(back, (e) => status(e.message, "err"));
-  if (v === "library") window.loadLibrary?.()?.then(back);
   if (v === "plugins") window.loadPlugins?.()?.then(back);
-  if (v === "sessions") window.loadSessionsPage?.()?.then(back);
   syncTitle();
   syncURL();
   return true;
@@ -24936,7 +25208,7 @@ navHides(); // the pages built-in plugins switched off have, from boot.js
 // from the tray or a reload) first, then the one kept; a page gateway mode
 // leaves out, or one there is no longer, gives way to the first page.
 // the pages the window can open on besides the first (Agents)
-const OPEN_VIEWS = ["providers", "routing", "usage", "sessions", "library", "plugins", "settings", ...magpie.pages()];
+const OPEN_VIEWS = ["providers", "routing", "usage", "plugins", "settings", ...magpie.pages()];
 function keptView() {
   const asked = params.get("view");
   if (asked === "agents" || OPEN_VIEWS.includes(asked)) return asked;

@@ -466,6 +466,9 @@
       case "resets": return t("It rests until {time}, when the vendor says the limit resets", { time });
       case "quota": return t("It rests 15 minutes: out of quota, with no word of when it resets");
       case "verify": return t("The vendor wants the account verified first: it rests half an hour, or until you say it's verified");
+      // its provider set never to rest after an unknown failure
+      // (`magpie provider rest-cap <id> off`): asked again next time
+      case "off": return t("It doesn't rest: its provider is set to ask it again after an error like this");
       // the vendor restricted the account itself (#1849): only its lifting,
       // which the vendor's appeal asks for, brings it back
       case "restricted": return t("The vendor restricted the account: it rests {d}, as only the vendor lifting the restriction brings it back. Appeal with the vendor; once it's lifted, try it again here", { d });
@@ -482,7 +485,7 @@
   }
 
   // the model a request went on: the one asked for, or the one set for
-  // Codex's subagents that magpie put a subagent on in its place
+  // an agent's subagents that magpie put a subagent on in its place
   const wentOn = (r) => (r.subagent && !r.subagent.kept ? r.subagent.to : r.model);
 
   // why routing put the first where it did
@@ -612,7 +615,7 @@
     switch (a.why) {
       case "session": return t("Kept on {who}: it answered this conversation before, and affinity keeps a session with one account.", { who: last });
       case "turn": return t("Kept on {who}: {agent} is handing back tool results within turn {n}, and moving now would lose what the vendor cached of it.", { who: last, agent: agentName(r.agent), n: a.turn });
-      case "cache": return t("Kept on {who}: the vendor read {n} tokens of this conversation from its cache {d} ago; anyone else would be sent them afresh and paid in full.", { who: last, n: tokens(a.cacheRead), d: ago });
+      case "cache": return t("Kept on {who}: {d} ago the vendor read {r} tokens of this conversation from its cache and wrote {w} to it; anyone else would be sent them afresh and paid in full.", { who: last, r: tokens(a.cacheRead || 0), w: tokens(a.cacheWrite || 0), d: ago });
       case "new-turn": return routing === "rotate"
         ? t("Turn {n} begins: in turn, it goes to the one after {who}, which answered the last turn — {next}.", { n: a.turn, who: last, next: who(r.order[0]) })
         : lead ? null : t("Turn {n} begins: affinity keeps a conversation only within a turn, so routing decides afresh.", { n: a.turn });
@@ -622,7 +625,7 @@
       case "resting": return t("{who} answered this conversation last, but it is resting, so the conversation moves.", { who: last });
       case "spent": return t("{who} answered this conversation last, but its allowance is all but used up, so the conversation moves.", { who: last });
       case "gone": return t("{who} answered this conversation last, but it is no longer one to route to.", { who: last });
-      case "no-cache": return t("{who} answered this conversation last, but the vendor read only {n} tokens of it from its cache then — not worth staying for.", { who: last, n: tokens(a.cacheRead || 0) });
+      case "no-cache": return t("{who} answered this conversation last, but the vendor then read only {r} tokens of it from its cache and wrote {w} — not worth staying for.", { who: last, r: tokens(a.cacheRead || 0), w: tokens(a.cacheWrite || 0) });
       case "cold": return t("{who} answered this conversation {d} ago, longer than the 5 minutes a vendor keeps a prompt cached — so routing decides afresh.", { who: last, d: ago });
       case "off": return t("Affinity is off: each request is routed afresh, whoever answered its conversation before.");
       case "rule": {
@@ -1079,7 +1082,13 @@
   // provider's in its own order — so the column holds still while the one
   // put first moves.
   // One whose vendor doesn't list the model to it is never asked, so it
-  // isn't drawn — only told of, among why it went where it did.
+  // isn't drawn — only told of, among why it went where it did. One held
+  // at its usage cap, or used up and set not to spend credits, is drawn,
+  // faded and saying so, as a resting one is: it is the user's own and
+  // comes back when its window renews, and a group member held so would
+  // otherwise vanish from the stage (#2129, wyq0x55: d-task's gpt-sol-6.1,
+  // used up, wasn't shown while a used-up Claude was).
+  const heldOut = (w) => !w.held && !!(w.capped || w.noCredits);
   function seated(r) {
     const members = r.group?.members || [];
     const key = (w) => {
@@ -1092,7 +1101,8 @@
       for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return typeof x[i] === "number" ? x[i] - y[i] : String(x[i]).localeCompare(String(y[i]));
       return 0;
     };
-    return [...r.order].sort(cmp);
+    const on = new Set(r.order.map(seat));
+    return [...r.order, ...(r.left || []).filter((w) => heldOut(w) && !on.has(seat(w)))].sort(cmp);
   }
 
   // a seat is one of a route's keys or accounts for one model: two of a
@@ -1153,6 +1163,10 @@
     return SPARE[h % SPARE.length];
   }
 
+  // foldersOf: the folders routes say, each once, in their order;
+  // lastLevel, a folder's last level ("workspace/magpie" → "magpie")
+  const foldersOf = (rs) => [...new Set(rs.map((r) => r.folder).filter(Boolean))];
+  const lastLevel = (f) => f.split("/").pop();
   function agentNode(id) {
     let a = agents.get(id);
     if (a) return a;
@@ -1327,7 +1341,13 @@
       const a = agents.get(id), r = rs.filter((x) => x.agent === id).pop(), ag = agentOf(id);
       if (a.icon !== (ag?.icon || "generic")) { a.icon = ag?.icon || "generic"; a.ic.replaceChildren(icon(a.icon)); }
       a.name.textContent = agentName(id);
-      a.sub.textContent = r.model;
+      // one agent working in more than one folder at once: which, by
+      // their last level (#1068). The stage holds an agent's latest
+      // request alone, so its others still going, or just done, count too.
+      const n = now(), going = pinned ? [] : [...src().values()].filter((x) => x.agent === id && (!x.done || at(x.time) + (x.ms || 0) > n - LINGER));
+      const fs = foldersOf([...new Set([...going, ...rs.filter((x) => x.agent === id)])].sort((x, y) => x.id - y.id));
+      a.sub.textContent = fs.length > 1 ? fs.map(lastLevel).join(", ") : r.model;
+      a.node.title = [agentName(id), r.model, ...fs.map((f) => t("Folder") + ": " + f)].join("\n");
     }
     // the account sets, the latest of each
     const latest = new Map();
@@ -1454,7 +1474,10 @@
     const on = r.order.filter((x) => !x.fallback).length;
     const pool = !g && f ? poolOf(f.provider) : null;
     const lone = !g && on <= 1 && !pool;
-    chip.textContent = t(m[0]);
+    // the head is told again every second: a chip whose text node is
+    // swapped while it is pressed gets no click in WebKit (#2151), so
+    // only what changed is written
+    setText(chip, t(m[0]));
     chip.hidden = lone;
     goTo(chip, g ? "group:" + g.id : pool ? "pool:" + f.provider : "", g ? g.name : f?.name || r.provider);
     hubText();
@@ -1467,12 +1490,13 @@
   // goTo makes what names a routing a way to where it is set: a provider's
   // own under Several accounts or keys, a group's its card
   function goTo(e, go, name) {
-    e.dataset.go = go;
     e.classList.toggle("rt-go", !!go);
     if (go) {
-      e.tabIndex = 0;
-      e.setAttribute("role", "button");
-      e.title = t("Change how {name} routes", { name });
+      const title = t("Change how {name} routes", { name });
+      if (e.dataset.go !== go) e.dataset.go = go;
+      if (e.tabIndex !== 0) e.tabIndex = 0;
+      if (e.getAttribute("role") !== "button") e.setAttribute("role", "button");
+      if (e.title !== title) e.title = title;
     } else for (const a of ["data-go", "tabindex", "role", "title"]) e.removeAttribute(a);
   }
   function goRouting(e, go) {
@@ -1567,15 +1591,17 @@
     const together = (f, ms) => {
       const has = (m, c) => m.li.classList.contains(c);
       const on = ms.find((m) => has(m, "on")), resting = ms.filter((m) => has(m, "rest")).length;
+      const held = ms.filter((m) => !has(m, "rest") && has(m, "left")).length; // at a cap, or used up (#2129)
       const parts = [];
       if (on) parts.push(`${who(on.w)}: ${on.st.textContent}`);
-      if (resting < ms.length) parts.push(t("{n} available", { n: ms.length - resting }));
+      if (resting + held < ms.length) parts.push(t("{n} available", { n: ms.length - resting - held }));
       if (resting) parts.push(t("{n} resting", { n: resting }));
+      if (held) parts.push(t("{n} held", { n: held }));
       setText(f.st, parts.join(" · "));
       f.li.classList.toggle("on", !!on);
       f.wire.classList.toggle("live", !!on);
       if (on) f.wire.style.setProperty("--agent", on.wire.style.getPropertyValue("--agent"));
-      return !!ms.length && resting === ms.length;
+      return !!ms.length && resting + held === ms.length;
     };
     for (const f of folds.values()) {
       const ms = (f.ids || []).map((id) => rows.get(id)).filter(Boolean);
@@ -1755,6 +1781,7 @@
       ? t("{agent} asked for {model}: {name} serves it, and the vendor is asked for {sent}", { agent: agentName(r.agent), model: r.model, name: main.name, sent: main.model })
       : t("{agent} asked for {model}", { agent: agentName(r.agent), model: r.model }) + " → " + (main?.name || r.provider), ""]);
     if (r.kind) items.push([kindWhy(r), "aside kind"]);
+    else if (r.subagent) items.push([subagentWhy(r), "aside"]);
     if (r.sealedTask) items.push([t(r.group
       ? "This subagent task is encrypted. Only ChatGPT accounts can read it; other providers (such as Claude) are excluded regardless of quota."
       : "This subagent task is encrypted. Only ChatGPT accounts can read it."), "aside"]);
@@ -1905,13 +1932,17 @@
     return k;
   }
   const upstreamWhy = (tr) => t("The aggregator passed the request on to {upstream}, as its reply says: the provider that actually answered it.", { upstream: tr.upstream });
-  function kindWhy(r) {
+  // the model set for an agent's subagents in place of the lead's pick,
+  // or why the lead's pick stood
+  function subagentWhy(r) {
     const agent = agentName(r.agent);
-    // the model set for Codex's subagents in place of the lead's pick, or
-    // why the lead's pick stood
-    if (purposeOf(r.kind) === "kind:collab_spawn" && r.subagent) return r.subagent.kept
+    return r.subagent.kept
       ? t("{agent} requested a subagent on {model} and it stayed there: its subagents are set to {to}, but {why}.", { agent, model: r.subagent.asked, to: r.subagent.to, why: t(r.subagent.kept) })
       : t("{agent} requested a subagent on {model}; magpie put it on {to}, the model set for its subagents.", { agent, model: r.subagent.asked, to: r.subagent.to });
+  }
+  function kindWhy(r) {
+    const agent = agentName(r.agent);
+    if (purposeOf(r.kind) === "kind:collab_spawn" && r.subagent) return subagentWhy(r);
     if (purposeOf(r.kind) === "kind:collab_spawn") return r.group
       ? t("{agent} requested a subagent; magpie selects its model within this routing group.", { agent })
       : t("{agent} requested a subagent on {model}.", { agent, model: r.model });
@@ -1976,11 +2007,13 @@
   // the row no longer says (#337)
   function reqTitle(r, how, tr) {
     const head = `${agentName(r.agent)} · ${r.model} → `;
+    // the folder its agent works in, the last two levels of it (#1068)
+    const folder = r.folder ? "\n" + t("Folder") + ": " + r.folder : "";
     const w = how !== "bad" && r.tries.length > 1 && tr && tried(r, tr);
-    if (!w) return head + r.provider;
+    if (!w) return head + r.provider + folder;
     const first = r.tries[0], f = tried(r, first);
     const from = f && seat(f) !== seat(w) ? "\n" + t("rerouted from {from}", { from: `${where(f)} · ${first.model || f.model}` }) : "";
-    return head + `${where(w)} · ${tr.model || w.model}` + from;
+    return head + `${where(w)} · ${tr.model || w.model}` + from + folder;
   }
 
   // the requests the gateway keeps, newest first: pick one to see how it was routed
@@ -2192,11 +2225,14 @@
       const memory = g.r.agent === "codex" && g.rows.every((r) => purposeOf(r.kind) === "kind:memory_consolidation");
       const suggestions = g.r.agent === "codex" && g.rows.every((r) => purposeOf(r.kind) === "kind:ambient_suggestions");
       const name = g.rows.find((r) => r.sessionTitle)?.sessionTitle || otherTitles.get(ownKey(g.r)) || (memory ? t("Background memory task") : suggestions ? t("Background prompt suggestions") : "");
-      setText(x.name, g.key ? agentName(g.r.agent) + " · " + (name || groupSession(g.r)) : t("No session ID"));
+      // the folder the session works in, as its latest request said it
+      // (#1068): it tells two runs of one agent apart before their titles
+      const folder = g.key ? g.rows.find((r) => r.folder)?.folder || "" : "";
+      setText(x.name, g.key ? [agentName(g.r.agent), folder, name || (folder ? "" : groupSession(g.r))].filter(Boolean).join(" · ") : t("No session ID"));
       const purpose = memory ? t("Codex is organizing memories from earlier chats in the background. This can continue after a chat finishes.") + "\n"
         : suggestions ? kindWhy(g.r) + "\n"
         : g.rows.some((r) => r.parentMatched) ? t("Title requests were automatically matched using the prompt and the applied chat title.") + "\n" : "";
-      x.name.title = g.key ? (name ? name + "\n" : "") + purpose + t("Session id") + ": " + groupSession(g.r) : t("These requests did not provide a session ID; they are not treated as one conversation.");
+      x.name.title = g.key ? (name ? name + "\n" : "") + purpose + (folder ? t("Folder") + ": " + folder + "\n" : "") + t("Session id") + ": " + groupSession(g.r) : t("These requests did not provide a session ID; they are not treated as one conversation.");
       const bits = [t(g.rows.length === 1 ? "{n} request" : "{n} requests", { n: g.rows.length })];
       if (visibleMetrics.includes("tokens") && total.tokens) bits.push(t("{n} tokens", { n: tokens(total.tokens) }));
       if (total.running) bits.push(t("{n} in progress", { n: total.running }));
@@ -3180,7 +3216,7 @@
     }
   }
 
-  function hubText() { hubSub.textContent = (providers?.gateway?.url || "").replace(/^https?:\/\//, "") || t("gateway"); }
+  function hubText() { setText(hubSub, (providers?.gateway?.url || "").replace(/^https?:\/\//, "") || t("gateway")); }
 
   // labels in the page's language, and again when it changes
   function words() {
@@ -3645,15 +3681,18 @@
     const name = tplName(tp);
     groupAction("template", { kind: tp.kind, name }, t("Added {name}", { name }));
   }
-  // editTemplate: the template in the editor, to change before it is saved
-  async function editTemplate(tp) {
+  // editTemplate: the template in the editor, filled in, to change before
+  // it is saved, brought into view: the groups can sit well below the
+  // click that asked for it. Its top, name first: the editor is taller
+  // than the window, and centred it opens halfway down the form
+  async function editTemplate(tp, ev) {
     if (groupDirty() && !(await confirmDiscard())) return;
     const g = tp.group;
     gSel = null;
     gEdit = { id: "", draft: { name: tplName(tp), slug: g.id, members: [...g.members], match: [], matched: [], fast: [], off: [], routing: g.routing || "", affinity: "", rules: (g.rules || []).map((r) => ({ ...r, intent: r.intent || "", agents: [...(r.agents || [])], folders: [], exceptFolders: [], time: null })), classifier: g.classifier || "", effort: "", levels: [] } };
     renderGroups();
     const ed = gList.querySelector(".rt-gedit");
-    ed?.scrollIntoView({ block: "nearest" });
+    if (ed && window.scrollOnPurpose?.(ev)) ed.scrollIntoView({ block: "start", behavior: "smooth" });
     ed?.querySelector("input")?.focus({ preventScroll: true });
   }
   function templateCards(tpls) {
@@ -3677,7 +3716,7 @@
         add.onclick = () => addTemplate(tp);
         const edit = el("button", "text rt-gtpl-edit", t("Edit first"));
         edit.type = "button";
-        edit.onclick = () => editTemplate(tp);
+        edit.onclick = (e) => editTemplate(tp, e);
         acts.append(add, edit);
         c.append(mem, acts);
       }
@@ -3686,8 +3725,10 @@
     box.append(cards);
     return box;
   }
-  // templateButton: the templates as a menu by New group, each added in a
-  // click, once the user has groups of their own
+  // templateButton: the templates as a menu by New group, once the user
+  // has groups of their own. A pick opens the template filled in, in the
+  // editor and in view, rather than adding a group out of sight (owner,
+  // 10-14: a group added somewhere below left the user lost)
   function templateButton(tpls) {
     const b = el("button", "text rt-gtplbtn");
     b.type = "button";
@@ -3700,7 +3741,7 @@
       if (again) return;
       openRowMenu(b, tpls.map((tp) => tp.need
         ? { name: tplName(tp), icon: PLUS, off: true, why: tplNeed(tp), run: () => {} }
-        : { name: tplName(tp), icon: PLUS, tip: t(TPL[tp.kind]?.[1] || "") + "\n" + tplMembers(tp), run: () => addTemplate(tp) }));
+        : { name: tplName(tp), icon: PLUS, tip: t(TPL[tp.kind]?.[1] || "") + "\n" + tplMembers(tp), run: (e) => editTemplate(tp, e) }));
     };
     return b;
   }
@@ -5070,7 +5111,7 @@
       n.node.style.setProperty("--agent", hueOf(id));
       n.wire.style.setProperty("--agent", hueOf(id));
       n.node.replaceChildren(icon(ag?.icon || "generic"), el("span", "ps-name", agentName(id)));
-      n.node.title = agentName(id);
+      n.node.title = [agentName(id), ...foldersOf(recent.filter((r) => r.agent === id).slice(0, 20).reverse()).map((f) => t("Folder") + ": " + f)].join("\n");
       return n.node;
     }));
     pTo.replaceChildren(...pDst.map((k) => {

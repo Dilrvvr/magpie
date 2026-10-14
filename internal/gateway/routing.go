@@ -380,7 +380,9 @@ type Rest struct {
 	// (the allowance window it filled renews), "quota" (no word of when),
 	// "cooldown" (a minute), "backoff" (longer each time it fails again,
 	// or is rate limited again as soon as it is back), "restricted" (the
-	// vendor restricted the account: two hours, or until lifted by hand).
+	// vendor restricted the account: two hours, or until lifted by hand),
+	// "off" (no rest: its provider is set not to rest after an unknown
+	// failure, provider.RestCapOff).
 	By       string `json:"by"`
 	Failures int    `json:"failures,omitempty"` // in a row, for a backoff
 	// Key is what it rests by, for the app to lift the rest (Unrest)
@@ -635,7 +637,7 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 	unread := why == failQuota && c.p.Account != nil && len(allowances(c.p.Account.UsageAgent())[c.p.Account.User]) == 0
 	// a model the key's plan doesn't serve rests alone, counted by itself
 	// (#1235): the key's other models are still served
-	unserved := why == failOther && modelRefused(status, body)
+	unserved := why == failOther && (modelRefused(status, body) || codeAssistModelMissing(c.p, status, body))
 	r := Rest{Why: why, Status: status, By: "cooldown"}
 	if why == failProxy {
 		// the account is as good as it was; the proxy is the user's to start
@@ -699,6 +701,16 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 		}
 		r.Link, _ = provider.Verification([]byte(r.said))
 	default:
+		// the provider set never to rest after a failure that says nothing
+		// of why (provider.RestCapOff; Kismet Alan on Discord: a relay's
+		// or an account pool's unknown errors come now and then, and the
+		// next request often goes through): it isn't set aside, nor its
+		// failure counted. A key refused, a model not served, or a window
+		// full still rests it, as they say why
+		if c.p.NoFailRest() && why == failOther && !unserved && status != http.StatusUnauthorized && status != http.StatusForbidden && (c.p.Account == nil || c.full(now).IsZero()) {
+			r.By, r.Until = "off", now
+			return r
+		}
 		counted := c.restKey()
 		if unserved {
 			counted = c.restID()
@@ -755,6 +767,9 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 	if (why == failCredit || why == failQuota) && c.p.PaidBesideFree(c.model) {
 		id = c.restID()
 	}
+	if remoteModelRest(c, why, header) {
+		id = c.restID()
+	}
 	r.Key = id
 	if id == c.restID() {
 		r.Model = c.model
@@ -770,6 +785,22 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 	return r
 }
 
+// remoteModelRest says a refusal for want of quota, credit or rate rests
+// only the model it was about, when it came from another computer's magpie
+// (a Remote magpie provider, LAN share): that magpie serves each of its
+// models from its own providers and rests them itself, so one of them out
+// of quota there says nothing of the others (bigsteven on Discord: the
+// remote's 429 for one model rested every model on it for the 3 hours it
+// named). Its key refused, or the computer unreachable, still rests it
+// whole, and so does the key's own limit there (keyLimited's 429, with
+// remoteKeyLimitHeader), which refuses every model alike (#2077).
+func remoteModelRest(c candidate, why string, header http.Header) bool {
+	if !c.p.IsRemoteMagpie() || header.Get(remoteKeyLimitHeader) != "" {
+		return false
+	}
+	return why == failQuota || why == failCredit || why == failRate
+}
+
 // rateRest is how long a rate-limited candidate sits out: as long as the
 // vendor says (Retry-After, a reset header or a reset time in its error),
 // and a minute when it says nothing. One limited again as soon as its rest
@@ -781,7 +812,7 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 // count where it is, so one request's own retries don't stretch it.
 func (s *Server) rateRest(c candidate, header http.Header, body []byte, sharedPool bool, now time.Time) (time.Duration, string, int) {
 	id := c.restKey()
-	if c.isOpenRouterFree() && sharedPool {
+	if c.isOpenRouterFree() && sharedPool || remoteModelRest(c, failRate, header) {
 		id = c.restID()
 	}
 	n := 1

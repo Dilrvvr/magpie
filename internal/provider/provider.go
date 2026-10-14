@@ -186,7 +186,8 @@ type Provider struct {
 	// out while it keeps failing or keeps being rate limited as soon as
 	// its rest is over (#2008); 0 is the gateway's own, 10 minutes for a
 	// failure and 30 for a rate limit. The vendor's own "try again in"
-	// still stands over it.
+	// still stands over it. RestCapOff (-1): no rest at all after a
+	// failure that says nothing of why, a rate limit's as the gateway's own.
 	RestCap int `json:"restCap,omitempty"`
 
 	// PriceRate is what the provider charges against the official price
@@ -334,6 +335,14 @@ type Provider struct {
 	// listed since is served beside picks that held every one listed then
 	// (withNewlyListed), and one listed then and left unpicked stays out.
 	PickedFrom []string `json:"pickedFrom,omitempty"`
+	// RefreshEvery, for a provider of the user's own, is how often the
+	// gateway fetches its model list by itself ("6h", "1d"; none, only when
+	// asked), as Fetch models does (#2135). See autolist.go.
+	RefreshEvery string `json:"refreshEvery,omitempty"`
+	// AutoInclude are patterns over a model's id (a glob with *, or a
+	// regular expression after "re:"): a model a fetch newly lists that one
+	// matches joins Models, beside the picks already there (#2135).
+	AutoInclude []string `json:"autoInclude,omitempty"`
 	// Unlisted keeps the provider's own models out of the list agents see:
 	// it serves only through the routing groups it is in, and by its
 	// "provider/model" ids.
@@ -393,6 +402,10 @@ type file struct {
 	// Routing page (#779), by id, found ones among them; one not in it
 	// follows those that are (see SetGroupOrder).
 	GroupOrder []string `json:"groupOrder,omitempty"`
+	// PluginLeft are the picks of a removed plugin's providers, set aside
+	// when it was removed and put back when it is added again (#2057; see
+	// plugin_left.go).
+	PluginLeft []LeftRecord `json:"pluginLeft,omitempty"`
 }
 
 // Path is the file the user's providers live in.
@@ -526,6 +539,7 @@ func (p Provider) clone() Provider {
 	p.Fallback = slices.Clone(p.Fallback)
 	p.Models = slices.Clone(p.Models)
 	p.PickedFrom = slices.Clone(p.PickedFrom)
+	p.AutoInclude = slices.Clone(p.AutoInclude)
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
 	p.AccountProxies = maps.Clone(p.AccountProxies)
@@ -1159,7 +1173,9 @@ func normalize(p Provider) Provider {
 	p.QueueLimit, p.QueueWait = min(max(p.QueueLimit, 0), MaxQueueLimit), min(max(p.QueueWait, 0), MaxQueueWait)
 	p.MaxRPM = min(max(p.MaxRPM, 0), MaxRPMLimit)
 	p.QuotaRest = min(max(p.QuotaRest, 0), MaxQuotaRest)
-	p.RestCap = min(max(p.RestCap, 0), MaxQuotaRest)
+	if p.RestCap != RestCapOff {
+		p.RestCap = min(max(p.RestCap, 0), MaxQuotaRest)
+	}
 	if _, err := ParseResetAt(p.QuotaResetAt); err != nil {
 		p.QuotaResetAt = ""
 	}

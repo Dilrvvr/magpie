@@ -514,6 +514,15 @@ body.mac :is(.view, .modal .dialog, .modal .editor.framed > .ebody)::-webkit-scr
    and scrolled sideways; the bar's room is always kept, out of the right
    padding, so the fields end where they did */
 body.mac .modal .editor.framed > .ebody { overflow-y: scroll; padding-right: 10px; }
+/* Usage and Routing keep their bar's room too, whether the page runs past
+   the window or not. Their square-celled grids (the year heatmap, Sessions'
+   calendar, the context waffle) grow taller as they grow wider, so near the
+   window's height WebKit could lay the page out at the full width under the
+   bar and, on each redraw (Requests' 5s refresh), 8px narrower for a few
+   frames: the head's refresh, interval and cost shook sideways with Today
+   picked (@LingYi_Stu on X). The other pages have no such grid and keep the
+   8px while short */
+body.window :is(#view-usage, #view-routing) { overflow-y: scroll; }
 .list { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; flex: none; }
 body.panel .list { border: 0; border-radius: 10px; box-shadow: var(--card-edge); }
 .row { display: flex; align-items: center; gap: 9px; min-height: 40px; padding: 5px 9px 5px 11px; }
@@ -1308,7 +1317,10 @@ body.window .field.solo { grid-column: auto; }
 .led .price-reference { font-size: 10px; color: var(--muted); }
 .led .cost { color: var(--green); }
 .led .cost.faint { color: var(--faint); }
-.led .who { display: inline-flex; align-items: center; gap: 6px; }
+/* a block of its own, centred in the cell as the time and the model are: an
+   inline-flex box took its icon's foot as its baseline, which raised the
+   name ~2px over them (#2237) */
+.led .who { display: flex; align-items: center; gap: 6px; }
 .led .who .ic { width: 14px; height: 14px; flex: none; }
 .led .swap { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; font-size: 10.5px; line-height: 16px; padding: 0 5px; border-radius: 5px; color: var(--amber); background: var(--amber-soft); }
 .led .st { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
@@ -2490,10 +2502,19 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 #gatewayKeys .klf-used { display: flex; align-items: center; gap: 8px; min-width: 0; }
 #gatewayKeys .klf-used .key-limit { flex: 1 1 auto; }
 #gatewayKeys .klf-used .klf-reset { flex: none; }
+/* a key's several limits (#2227): one tab each, the editor is of one */
+#gatewayKeys .klf-which { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+#gatewayKeys .klf-tab { height: 24px; padding: 0 10px; border-radius: 6px; font-size: 12px; color: var(--ctl-fg); white-space: nowrap; }
+#gatewayKeys .klf-tab:hover:not(.on) { color: var(--fg-2); }
+#gatewayKeys .klf-tab.on { color: var(--fg); background: var(--seg-thumb); box-shadow: var(--seg-edge); }
 @media (max-width: 520px) { #gatewayKeys .klf, #gatewayKeys .klf.with-days { grid-template-columns: 1fr; } #gatewayKeys .klf-used { flex-wrap: wrap; } }
 /* the models a key may use (#882): a long model's id is cut, and the
    badge gives way first on a narrow window */
 #gatewayKeys .amodels.key-models { display: inline-block; flex: 0 1 auto; min-width: 24px; max-width: 180px; line-height: 20px; overflow: hidden; text-overflow: ellipsis; }
+/* a key's quotas badge (#2216) takes no room until the row is hovered,
+   and gives way before the row runs past a narrow window */
+#gatewayKeys .amodels.key-quotas { display: inline-block; flex: 0 1 auto; min-width: 0; line-height: 20px; overflow: hidden; text-overflow: ellipsis; }
+#gatewayKeys .acc:not(:hover) > .key-quotas:not(.set):not(:focus) { max-width: 0; padding: 0; margin-left: -9px; box-shadow: none; }
 /* the Settings row's picker: the key row's badge, always shown */
 .row.pref .proto.pick { flex: none; margin-left: auto; display: inline-flex; align-items: center; gap: 3px; height: 24px; padding: 0 6px 0 9px; font: inherit; font-size: 12px; color: var(--fg-2); border: 0; border-radius: 7px; background: var(--pill); white-space: nowrap; cursor: default; transition: background .12s, color .12s; }
 .row.pref .proto.pick svg { opacity: .7; transition: transform .15s var(--ease); }
@@ -3313,6 +3334,12 @@ body.panel .modal { padding: 16px 12px; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  /* what declares no transition of its own keeps none: its default is
+     `all 0s`, which the rule above made `all .01ms`, so a header tab's
+     label took a frame to come to its new size, the header was fitted to
+     the old one, and the page stayed a few pixels wider than the window
+     (#2142, #1864, #2023). No specificity: any transition declared wins. */
+  :where(*), :where(*)::before, :where(*)::after { transition-property: none; }
   .skeleton { animation: none !important; }
 }
 
@@ -3415,6 +3442,8 @@ body.panel .modal { padding: 16px 12px; }
   body.web .acc :is(.text.quiet, .proto, .amodels, .alane) { opacity: 1; }
   body.web .accts.keys .acc > :is(.amodels, .proto, .alane, .text.quiet) { max-width: none !important; padding: 0 7px !important; flex-shrink: 0 !important; }
   body.web .accts.keys .acc > .alane:not(.set) { margin-left: 0 !important; }
+  body.web #gatewayKeys .acc > .key-quotas { max-width: none !important; padding: 0 7px !important; margin-left: 0 !important; flex-shrink: 0; }
+  body.web #gatewayKeys .acc > .key-quotas:not(.set) { box-shadow: inset 0 0 0 1px var(--line) !important; }
 }
 
 /* Import from other apps: a checklist per app */
@@ -3714,6 +3743,9 @@ body.window .row.agent .who.with-models { flex-wrap: wrap; row-gap: 0; }
    (claude-direct.test.cjs); the page holds the reader itself */
 #view-agents { overflow-anchor: none; }
 body.window .row.agent > .ag-conn { margin-left: 12px; align-self: center; cursor: pointer; }
+/* a row whose CLI is gone (#2177) has no pickers: its switch, while it is
+   connected, sits at the row's end */
+body.window .row.agent.gone > .ag-conn { margin-left: auto; }
 .ag-conn-row { display: flex; align-items: center; gap: 8px; min-height: 28px; }
 .ag-conn-row .ag-conn-said { flex: 1; min-width: 0; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ag-conn-row .lib-switch { cursor: pointer; }

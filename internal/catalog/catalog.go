@@ -454,7 +454,7 @@ var (
 	// is, so it is never taken for another either (renamed)
 	canonical map[string]bool
 
-	syncMu sync.Mutex
+	syncCh = make(chan struct{}, 1)
 )
 
 // CachePath is where `magpie sync` stores the models.dev catalog.
@@ -620,8 +620,25 @@ func Reset() {
 // Sync downloads the models.dev catalog into CachePath. It serializes with
 // itself so a background refresh and a manual one cannot interleave writes.
 func Sync(ctx context.Context) error {
-	syncMu.Lock()
-	defer syncMu.Unlock()
+	return syncLock(ctx, false)
+}
+
+// SyncIfMissing is Sync, but returns nil if a catalog already exists once the
+// lock is acquired.
+func SyncIfMissing(ctx context.Context) error {
+	return syncLock(ctx, true)
+}
+
+func syncLock(ctx context.Context, onlyIfMissing bool) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case syncCh <- struct{}{}:
+	}
+	defer func() { <-syncCh }()
+	if onlyIfMissing && Source() != "" {
+		return nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsDevURL, nil)
 	if err != nil {
 		return err
@@ -783,9 +800,11 @@ func canonicallyPriced(all map[string]mdProvider, providers []string, b string) 
 func dashed(id string) string { return strings.ReplaceAll(id, ".", "-") }
 
 // APIOf is the API a models.dev provider's model is served on, when the
-// catalog says it's one of its own: "responses" or "anthropic" for a model
-// OpenCode serves through OpenAI's or Anthropic's SDK, not the
-// OpenAI-compatible one the rest of its models go through.
+// catalog says it's one of its own: "responses", "anthropic" or "gemini"
+// for a model OpenCode serves through OpenAI's, Anthropic's or Google's
+// SDK (Gemini's generateContent: Zen's Gemini models, Go's Gemini 4 Argon
+// Contributor, #2168), not the OpenAI-compatible one the rest of its
+// models go through.
 func APIOf(providerID, modelID string) string {
 	if p, ok := load()[providerID]; ok {
 		if m, ok := p.Models[modelID]; ok && m.Provider != nil {
@@ -794,6 +813,8 @@ func APIOf(providerID, modelID string) string {
 				return "responses"
 			case "@ai-sdk/anthropic":
 				return "anthropic"
+			case "@ai-sdk/google":
+				return "gemini"
 			}
 		}
 	}

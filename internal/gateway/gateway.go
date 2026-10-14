@@ -60,6 +60,10 @@ func agentOf(r *http.Request) string {
 	if isClaudeDesktop(r) {
 		return "claude-desktop"
 	}
+	if isClaudeScience(r) {
+		// Claude Science's client, an Anthropic SDK's User-Agent
+		return ScienceID
+	}
 	ua := r.Header.Get("User-Agent")
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(ua)), "cursor") {
 		// cursor-agent talks to Cursor's backend alone, never to a
@@ -80,7 +84,7 @@ func startedByAgent(r *http.Request, agent string) bool {
 	if _, ok := strings.CutPrefix(callerKey(r), Token+"-"); ok {
 		return false
 	}
-	return agent != "claude-desktop" && agent != "cursor-local" && !usage.IsAgent(agent)
+	return agent != "claude-desktop" && agent != "cursor-local" && agent != ScienceID && !usage.IsAgent(agent)
 }
 
 // StandIn is the model an agent is set to use in place of one it named that
@@ -647,24 +651,26 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 // asks of it while the gateway is shared or MAGPIE_ADDR puts it on the
 // network. A key held to a budget, models or accounts is someone else's
 // to use and is told none of it (refuseHeld), as are quotasHistory,
-// quotaCards, quotaCardsRefresh and concurrency.
+// quotaCards, quotaCardsRefresh and concurrency; one its owner lets be
+// told its quotas is told those of what it may use (scopeQuotas, #2216).
 func (s *Server) quotas(w http.ResponseWriter, r *http.Request) {
 	if !local(r) && !sharedWith(r) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
 		return
 	}
-	if refuseHeld(w, r, heldRefused) {
+	scope, ok := scopeQuotas(w, r)
+	if !ok {
 		return
 	}
 	// ?kept=1: what was last read, no vendor asked (magpie statusline,
 	// run on every message, #1997)
 	if r.URL.Query().Get("kept") == "1" {
-		writeJSON(w, 200, map[string]any{"object": "list", "data": provider.KeptQuotaReport(time.Now())})
+		writeJSON(w, 200, map[string]any{"object": "list", "data": scope.quotas(provider.KeptQuotaReport(time.Now()))})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
-	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.QuotaReport(ctx, time.Now())})
+	writeJSON(w, 200, map[string]any{"object": "list", "data": scope.quotas(provider.QuotaReport(ctx, time.Now()))})
 }
 
 // quotasHistory is what was left of each account's windows over time, as
@@ -676,11 +682,12 @@ func (s *Server) quotasHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
 		return
 	}
-	if refuseHeld(w, r, heldRefused) {
+	scope, ok := scopeQuotas(w, r)
+	if !ok {
 		return
 	}
 	q := r.URL.Query()
-	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.QuotaHistories(provider.QuotaHistorySince(q.Get("days"), time.Now()), q.Get("provider"), q.Get("user"))})
+	writeJSON(w, 200, map[string]any{"object": "list", "data": scope.histories(provider.QuotaHistories(provider.QuotaHistorySince(q.Get("days"), time.Now()), q.Get("provider"), q.Get("user")))})
 }
 
 // quotaCards is the Usage page's cards as this magpie last read them, for
@@ -691,10 +698,11 @@ func (s *Server) quotaCards(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
 		return
 	}
-	if refuseHeld(w, r, heldRefused) {
+	scope, ok := scopeQuotas(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.CachedCards(time.Now())})
+	writeCards(w, r, scope)
 }
 
 // remoteRefreshes is when another magpie last had each card read again
@@ -716,12 +724,20 @@ func (s *Server) quotaCardsRefresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
 		return
 	}
-	if refuseHeld(w, r, heldRefused) {
+	scope, ok := scopeQuotas(w, r)
+	if !ok {
 		return
 	}
 	id, user := r.URL.Query().Get("provider"), r.URL.Query().Get("user")
 	if strings.Contains(id, "/") || provider.IsRemoteCard(id) { // a card this magpie has from another: not passed on
 		writeError(w, provider.Chat, http.StatusBadRequest, "this magpie reads only its own cards again")
+		return
+	}
+	// a key told only some cards (#2216) has only those read again: a
+	// card it isn't told is refused, as if held, and with none named
+	// each card it is told is read, not every account here
+	if scope != nil && id != "" && !scope.card(id, user) {
+		refuseHeld(w, r, heldRefused)
 		return
 	}
 	key := id + "|" + strings.ToLower(user)
@@ -733,14 +749,19 @@ func (s *Server) quotaCardsRefresh(w http.ResponseWriter, r *http.Request) {
 	remoteRefreshes.Unlock()
 	if due {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		if id == "" {
-			provider.ReadAllCards(ctx)
-		} else {
+		switch {
+		case id != "":
 			provider.RefreshUsage(ctx, id, user)
+		case scope != nil:
+			for _, q := range scope.cards(provider.CachedCards(time.Now())) {
+				provider.RefreshUsage(ctx, q.Provider, q.User)
+			}
+		default:
+			provider.ReadAllCards(ctx)
 		}
 		cancel()
 	}
-	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.CachedCards(time.Now())})
+	writeCards(w, r, scope)
 }
 
 func modelObject(e provider.Entry) map[string]any {
@@ -903,8 +924,10 @@ func catalogFor(r *http.Request) []provider.Entry {
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	data := []map[string]any{}
 	shown := catalogFor(r)
-	if agentOf(r) == "claude-desktop" {
+	if agent := agentOf(r); agent == "claude-desktop" {
 		data = desktopModels(shown)
+	} else if agent == ScienceID {
+		data = scienceModels(shown)
 	} else {
 		labels := provider.Labels(shown)
 		// for another magpie: how it searches the web for each model
@@ -1012,6 +1035,12 @@ func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 	shown := keyAllowed(r, provider.Catalog())
 	for _, e := range shown {
 		if e.ID == id {
+			if agentOf(r) == ScienceID {
+				// by the alias it asked by, which it keeps what it reads
+				// under
+				writeJSON(w, 200, scienceObject(e, provider.Labels([]provider.Entry{e})[0]))
+				return
+			}
 			writeJSON(w, 200, modelObject(e))
 			return
 		}
@@ -1491,6 +1520,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	if agent == "claude-desktop" {
 		sub, _ := subagentOf(r.Header)
 		asked = desktopTurn(asked, body, fromClaudeCode(r.Header), sub != "")
+	} else if agent == ScienceID {
+		asked = scienceTurn(asked, body)
 	}
 	// a stand-in that is a tier at an effort of its own ("<model>:<level>",
 	// #536) is that model at that level, as were it asked for so
@@ -2015,7 +2046,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		capture.tools = tools
 	}
 	tierAsked := bodyTier(from, body) // the service tier the client asked for (#1784)
-	tr := s.trace.beginFor(r, Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pin, Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Subagent: subagent, Affinity: shown, Order: pl.order, Left: pl.left})
+	tr := s.trace.beginFor(r, Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pin, Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Subagent: subagent, Sub: subOf(r.Header), Affinity: shown, Order: pl.order, Left: pl.left})
 	if telemetry != nil {
 		telemetry.routeID = tr.ID
 	}
@@ -2174,11 +2205,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			continue
 		}
 		// a group tells agents the longest reply a member of it gives
-		// (groupEntries); each member is asked for no more than its own
+		// (groupEntries); each member is asked for no more than its own.
+		// Outside a group only the user's own Max output lowers a request
+		// (userOutput): a vendor's figure may be stale, the user's is asked
 		if isGroup {
 			if n := outputLimit(c.p, c.model); n > 0 {
 				attemptBody = withMaxOutput(from, attemptBody, n)
 			}
+		} else if n := userOutput(c.p, c.model); n > 0 {
+			attemptBody = withMaxOutput(from, attemptBody, n)
 		}
 		picked := false // the effort asked for in place of the agent's
 		// a member fixed at an effort (#189), else the model asked for at
@@ -2297,7 +2332,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// the models Copilot's Auto picked for it, where from, and which
 		// were refused (#256)
 		autoPicked := func() []provider.AutoPick { return nil }
-		if said, ok := verifyHeld(c.restKey()); ok && last {
+		if said, ok := verifyHeld(c); ok && last {
 			// the account must be verified first (#152): the agent's
 			// reconnects are told so again, not sent on to a vendor that
 			// just refused it
@@ -2379,6 +2414,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					// its end or the agent has gone: attempt returns then
 					defer release()
 					defer hw.watch()()
+					defer notePhase(ctx, "upstream")()
 					call.Status, call.Error = s.attempt(hw, r.WithContext(ctx), from, c.p, c.model, attemptBody, &call)
 				}()
 			}
@@ -3432,7 +3468,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		// the tier it goes at, the user's own fields in it (#1784)
 		noteWireTier(ctx, to, body)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.Base(to)+path, bytes.NewReader(body))
+	base := p.Base(to)
+	if p.IsOpenCode() && p.OpenCodeFree(gjson.GetBytes(body, "model").String()) {
+		// Zen's free tier answers at the inference API's URL alone (zenfree.go)
+		base = provider.OpenCodeFreeURL(base)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -4341,7 +4382,7 @@ func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
 	apis := p.APIs(model)
 	var out []provider.Protocol
 	for _, proto := range p.Speaks() {
-		if s.fits(p.ID, model, proto) && (apis == nil || slices.Contains(apis, proto)) {
+		if s.fits(p.ID, model, proto) && (apis == nil && !p.NamedOnlyOn(proto) || slices.Contains(apis, proto)) {
 			out = append(out, proto)
 		}
 	}
@@ -5435,6 +5476,11 @@ func encoder(proto provider.Protocol, w *sseWriter, r *Request, usage ...*Usage)
 		// outside usageEncoder, which reads its encoder's reply id
 		enc = &wholeEncoder{streamEncoder: enc}
 	}
+	if r.wantsJSON() {
+		// a fenced JSON answer reaches a structured-output client as the
+		// JSON it asked for (format_fence.go)
+		enc = &fenceEncoder{streamEncoder: enc}
+	}
 	return enc
 }
 
@@ -5456,6 +5502,7 @@ func render(proto provider.Protocol, res Result, r *Request) []byte {
 	if r.Grok {
 		res = wholeResult(res)
 	}
+	res = unfencedResult(res, r)
 	switch proto {
 	case provider.Chat:
 		return renderChat(res, model)
@@ -5615,10 +5662,12 @@ func developerAsSystem(body []byte) []byte {
 }
 
 // sessionHeaders are where agents already name their conversation: OpenCode
-// (to its own gateway, and to everyone else), Pi, Codex and Claude Code.
+// (to its own gateway, and to everyone else), Pi, Codex, Claude Code and
+// WorkBuddy / CodeBuddy (X-Conversation-ID).
 var sessionHeaders = []string{
 	"x-opencode-session", "x-session-affinity", "x-session-id",
 	"session_id", "session-id", "x-claude-code-session-id",
+	"x-conversation-id",
 }
 
 // SessionHeader names the session a call is part of, for the usage log to
@@ -5658,6 +5707,12 @@ func subagentOf(in http.Header) (agent, parent string) {
 	}
 	parent = strings.TrimSpace(in.Get("x-claude-code-parent-agent-id"))
 	return agent[:min(len(agent), 128)], parent[:min(len(parent), 128)]
+}
+
+// subOf is the subagent a request is of, as subagentOf has it.
+func subOf(in http.Header) string {
+	sub, _ := subagentOf(in)
+	return sub
 }
 
 // nativeSessionOf keeps the client session even when magpie's header overrides it.

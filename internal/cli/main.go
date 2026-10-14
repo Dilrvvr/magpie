@@ -115,8 +115,9 @@ const usage = `magpie — one place to pick every agent's model
                                   the service's page: its link, or turn it on or off
   magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
   magpie gateway-key list|add <name>|rotate <id>|remove <id>   manage the keys clients use to call a shared gateway
-  magpie gateway-key limit <id> [off|reset|day|week|month|<N>d|<N>h --tokens N --cost USD --cache-reads]   a key's own limit, and what it used
+  magpie gateway-key limit <id> [list|off|reset [n]|remove <n>|[add] day|week|month|<N>d|<N>h --tokens N --cost USD --cache-reads]   a key's own limits, and what it used
   magpie gateway-key models <id> [all|<provider>/<model>|<provider>/* ...]   the models a key may use, every one unless it names some
+  magpie gateway-key quotas <id> [on|off]   whether a key held to a budget, models or accounts is told the quotas of what it may use
   magpie mcp image                the image and video generation MCP server an agent is given from the library (stdio)
   magpie usage [today|7d|30d|all] tokens and cost per agent, model and subscription account (30d)
   magpie usage --csv [--account <name>] [today|7d|30d|all]   every request as CSV (or one account's): the model asked for, sent and served, tokens, cost, time, status, account
@@ -268,6 +269,9 @@ func run(args []string) error {
 	// and Cursor Private Inference's variables, which the Mac's launchd
 	// forgets at a restart, for the gateway's address now
 	gateway.WhileServing = append(gateway.WhileServing, agent.KeepCursorLocalEnv)
+	// and Claude Science's daemon, which a restart of the computer ends,
+	// started on the gateway again while it is connected
+	gateway.WhileServing = append(gateway.WhileServing, agent.KeepClaudeScience)
 	// and the request archive, when it is on, goes to the bucket sync is to
 	gateway.ArchiveBucket = func() (gateway.Putter, bool) {
 		if b, ok := davsync.S3Bucket(); ok {
@@ -611,6 +615,11 @@ func list(agents []*agent.Agent, detectedOnly bool, dimFrom int) error {
 			r.name = faint.Render(a.Name)
 			r.vals = faint.Render("not detected")
 			r.path = ""
+		} else if a.CLIMissing() {
+			// its folder left by an uninstall (#2173): what it holds is
+			// read by nothing
+			r.name = faint.Render(a.Name)
+			r.vals = faint.Render("CLI not found")
 		} else {
 			vals := a.Values()
 			dim := dimFrom >= 0 && i >= dimFrom

@@ -967,6 +967,13 @@ event) leaves what it was given as it was. Settings → Plugins shows each
 middleware's calls, time and failures. The [plugin guide](https://usemagpie.ai/docs/plugins#middleware)
 has the rest.
 
+Middleware runs through the built-in plugin `middleware` (Gateway
+middleware in Plugins › Built-in), which stays on while one is on. Turned
+off, no middleware runs and agents' requests go as they came. Privacy
+masking is the built-in plugin `redact` (Privacy masking), on while
+Settings → Privacy asks for any masking; if masking is asked for and it
+isn't serving, a request gets a 503 and nothing is sent.
+
 `ctx.options` is the middleware's entry's `options` in `plugins.json`: set
 them with its **Options** button in Plugins › Installed, or
 
@@ -1336,6 +1343,18 @@ including fixed headers for custom providers in
 subsequent changes to agent settings are not automatically copied to magpie.
 Entries that point back to magpie or only name an `env_key` are skipped.
 
+The same dialog reads OpenCode's own sign-ins, `auth.json` in
+`$XDG_DATA_HOME/opencode` (`~/.local/share/opencode` when unset, on Windows
+too), where `opencode auth login` keeps them. An API key comes in on the
+magpie preset at the same address: OpenCode Go's key on OpenCode Go, Zen's
+(`opencode`) on OpenCode Zen, and a vendor's (OpenAI, Anthropic, DeepSeek,
+OpenRouter and others) on its own. OpenCode keeps no address beside a key,
+so one of a provider magpie has no preset for is listed and skipped. Sign-ins
+(Claude Pro/Max, Copilot, an enterprise server's token) are listed and
+skipped; add the subscription in magpie instead. OpenCode is read only when
+you open the dialog: the Providers page's automatic check leaves it out, as
+the file holds every sign-in OpenCode has. magpie never writes to it.
+
 ### How magpie picks an account
 
 When a subscription has several accounts on (Claude Code's or Codex's
@@ -1425,6 +1444,12 @@ The routings besides Smart are the built-in plugin `rotation` (Routing
 strategies in Plugins › Built-in). It stays on while a provider or group is
 routed by one of them. Turned off, the pickers offer Smart alone, and a
 provider or group still set to one of them is tried in its listed order.
+
+Your own routing groups are the built-in plugin `groups` (Routing groups in
+Plugins › Built-in), which stays on while you have one. The groups magpie
+finds for a model two providers serve don't need it. Turned off, the gateway
+doesn't list or serve a group of your own, and the Routing page has no New
+group button; `magpie groups` still lists them.
 
 **Make first** sets the accounts' order. How much that order counts
 depends on the routing:

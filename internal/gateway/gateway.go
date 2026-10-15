@@ -29,8 +29,11 @@ import (
 
 	"github.com/tidwall/gjson"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/awake"
-
+	"github.com/yetone/magpie/internal/gwbudget"
+	"github.com/yetone/magpie/internal/gwmw"
+	"github.com/yetone/magpie/internal/gwtool"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/pluginrt"
 	"github.com/yetone/magpie/internal/provider"
@@ -477,9 +480,39 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// `magpie plugin builtin`) come and go here too
 	stopObservers := usage.ServeObservers()
 	defer stopObservers()
+	// and the user's own routing groups are served while plugins/groups is
+	// on (provider.GateGroups); one made a moment ago turns it on as it is
+	// looked up, not on KeepFresh's next look
+	stopGroups := provider.GateGroups(func() {
+		if _, err := pluginrt.Refresh(); err != nil {
+			log.Printf("plugins: %v", err)
+		}
+	})
+	defer stopGroups()
+	// and magpie's own tools (its web search) are offered and answered
+	// while the plugin serving each is on (gwtool)
+	stopTools := gwtool.Gate()
+	defer stopTools()
+	// and a request masking is wanted for, with no masker served, turns
+	// plugins/redact on as it is sent rather than being refused until
+	// KeepFresh's next look (gwmw.Served)
+	stopMasking := gwmw.Refresh(func() {
+		if _, err := pluginrt.Refresh(); err != nil {
+			log.Printf("plugins: %v", err)
+		}
+	})
+	defer stopMasking()
+	// as does a request of a gateway key held to a limit for plugins/budget
+	// (gwbudget.Limiting)
+	stopLimits := gwbudget.Refresh(func() {
+		if _, err := pluginrt.Refresh(); err != nil {
+			log.Printf("plugins: %v", err)
+		}
+	})
+	defer stopLimits()
 	freshCtx, stopFresh := context.WithCancel(ctx)
 	defer stopFresh()
-	go pluginrt.KeepFresh(freshCtx, 2*time.Second, settings.Path(), provider.Path())
+	go pluginrt.KeepFresh(freshCtx, 2*time.Second, settings.Path(), provider.Path(), plugin.ListPath(), access.Path())
 	srv := &http.Server{Handler: lanGuard(s.Handler()), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
 	// the magpie serving the gateway, and only it, keeps the saved accounts
 	// signed in, so two never refresh one sign-in at once
@@ -1131,8 +1164,12 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	// Count the same masked prompt that generation sends to the vendor.
 	plain := body
-	w, body, unmask := redacted(w, body)
+	w, body, unmask, err := redacted(w, body)
 	defer unmask()
+	if err != nil {
+		writeError(w, provider.Anthropic, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	named := unprefixed(model)
 	if m := claudeTierStandIn(r, agentOf(r), model); m != "" {
 		model = m // counted on the model the request will go to
@@ -1451,8 +1488,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// unmasked (unredactedRoute)
 	plain := body
 	var masked []byte // the masked body, when plain goes instead
-	w, body, unmask := redacted(w, body)
+	w, body, unmask, err := redacted(w, body)
 	defer unmask()
+	if err != nil { // fails closed: never sent unmasked
+		log.Printf("gateway: %v", err)
+		writeError(w, from, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	// the reply's model the member that answered, when asked for (#822)
 	w, r, named := withMemberNames(w, r)
 	defer named()
@@ -3671,7 +3713,10 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	}
 	// Cline's whole replies come in {success, data}; a web page or
 	// nothing at all, served 200, is the 502 it stands for (#1012)
-	res = notAnAPIReply(clineUnwrapped(p, res), "")
+	// Zhipu's and Z.ai's Responses API refuses a key 200 in the platform's
+	// envelope: the 401 (or 429 …) it stands for, so the next key or
+	// member is asked and the agent told why (@xanahopper on X)
+	res = notAnAPIReply(clineUnwrapped(p, provider.ZhipuEnveloped(req, res)), "")
 	if p.Account != nil && p.Account.Agent == "codex" {
 		// a large request ChatGPT closed the connection on: asked again,
 		// nobody resting for it, and said what may help (#1628)
@@ -4200,7 +4245,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 		keepRetry(w.Header(), res.Header, b)
 		u.ErrType = provider.ErrorType(b)
-		return writeError(w, proto, res.StatusCode, msg), msg, true
+		return writeVendorError(w, proto, res.StatusCode, msg, b), msg, true
 	}
 	rd, sse := eventStream(res)
 	client := w
@@ -5250,7 +5295,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		if turnedAway {
 			u.ErrType = turnedAwayErrType
 		}
-		return writeError(w, from, res.StatusCode, msg), msg
+		return writeVendorError(w, from, res.StatusCode, msg, b), msg
 	}
 	dec := decoder(actual)
 	rd, sse := eventStream(res)
@@ -5293,7 +5338,10 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 			said += " — " + antigravityTurnedAwayHint
 			u.ErrType = turnedAwayErrType
 		}
-		return writeError(w, from, 502, p.Name+": "+said), said
+		// a request the vendor refused in its stream is answered as
+		// refused, with its code (magpie-releases#18); anything else is
+		// the vendor failing
+		return writeVendorError(w, from, cmp.Or(col.errStatus, 502), p.Name+": "+said, col.errSaid), said
 	}
 	if col.err == "" && !ended && (actual == provider.Anthropic || actual == provider.Responses || geminiKin(actual)) && r.Context().Err() == nil {
 		// an Anthropic stream that just stopped — no stop_reason, no
@@ -6167,6 +6215,30 @@ func streamError(w http.ResponseWriter, proto provider.Protocol, status int, msg
 
 // writeError answers in the client's own error shape.
 func writeError(w http.ResponseWriter, proto provider.Protocol, status int, msg string) int {
+	return writeErrorSaid(w, proto, status, msg, nil, nil)
+}
+
+// writeVendorError answers a vendor's error status in the client's own
+// shape, as writeError does, keeping the code and param the vendor named
+// (an OpenAI-shaped error's strings) for a client of OpenAI's shape: the
+// ChatGPT backend's invalid_access_program on access_programs.cyber
+// (magpie-releases#18) reaches the agent as the backend said it.
+func writeVendorError(w http.ResponseWriter, proto provider.Protocol, status int, msg string, body []byte) int {
+	var code, param any
+	if e := gjson.GetBytes(body, "error"); e.IsObject() {
+		if c := e.Get("code"); c.Type == gjson.String && c.String() != "" {
+			code = c.String()
+		}
+		if p := e.Get("param"); p.Type == gjson.String && p.String() != "" {
+			param = p.String()
+		}
+	}
+	return writeErrorSaid(w, proto, status, msg, code, param)
+}
+
+// writeErrorSaid is writeError with the code and param an OpenAI-shaped
+// answer names, nil for none.
+func writeErrorSaid(w http.ResponseWriter, proto provider.Protocol, status int, msg string, code, param any) int {
 	typ := "api_error"
 	switch {
 	case status == 400:
@@ -6184,7 +6256,6 @@ func writeError(w http.ResponseWriter, proto provider.Protocol, status int, msg 
 	case status == 529:
 		typ = "overloaded_error"
 	}
-	var code any
 	if tooLong(status, msg) {
 		// said the way the client's own API says it, so the agent
 		// compacts the conversation and tries again rather than stopping
@@ -6211,7 +6282,7 @@ func writeError(w http.ResponseWriter, proto provider.Protocol, status int, msg 
 		}
 		v = map[string]any{"error": map[string]any{"code": status, "message": msg, "status": st}}
 	default:
-		v = map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": code, "param": nil}}
+		v = map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": code, "param": param}}
 	}
 	writeJSON(w, status, v)
 	return status

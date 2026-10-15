@@ -9572,9 +9572,9 @@ async function openImportApps(discovered) {
   renderProviders();
 }
 
-// appIcon is an import source's logo; Claude Code has its mark among the
-// vendor icons rather than an app tile of its own.
-const appIcon = (id) => id === "claude-code" ? "icons/claudecode-color.svg" : id === "codex" ? "icons/codex-color.svg" : `icons/app-${id}.png`;
+// appIcon is an import source's logo; Claude Code, Codex and OpenCode have
+// their marks among the vendor icons rather than an app tile of their own.
+const appIcon = (id) => id === "claude-code" ? "icons/claudecode-color.svg" : id === "codex" ? "icons/codex-color.svg" : id === "opencode" ? "icons/opencode.svg" : `icons/app-${id}.png`;
 
 function renderImportApps(ia) {
   const ed = el("div", "editor new importapps");
@@ -12616,6 +12616,10 @@ function quotaError(err) {
   // reads none — said with the way out, as a phone can't hover for it
   if (/^this key has no OpenCode Go subscription/.test(err)) return t("No OpenCode Go on this key — use a key made by the member who subscribed, in that workspace");
   if (/^OpenCode didn't take this key/.test(err)) return t("OpenCode didn't take this key — paste a current one in the provider's settings");
+  // a GLM key Zhipu or Z.ai refused (zhipuRefused, planquota.go): the key
+  // is what to change, not a reading that failed (@xanahopper on X)
+  const glm = /^(Zhipu|Z\.ai) didn't take this key/.exec(err);
+  if (glm) return t("{vendor} didn't take this key — it expired, was deleted or is mistyped; paste a current one in the provider's settings", { vendor: glm[1] });
   if (/^OpenCode Go's reply has no rolling/.test(err)) return t("OpenCode Go answered in a form magpie doesn't read — hover for what it sent");
   // a remote magpie's card (remote_quotas.go)
   if (/^nothing read on that magpie yet/.test(err)) return t("Nothing read on that computer yet — refresh this card to have it read");

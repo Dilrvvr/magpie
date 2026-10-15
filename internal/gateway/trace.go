@@ -64,6 +64,14 @@ type Route struct {
 	// Sub: the Claude Code subagent the request is of (subagentOf), whose
 	// session header is its conversation's; "" for the conversation's own
 	Sub string `json:"sub,omitempty"`
+	// SubagentEffort is Desktop's configured effort. Tries keep the actual
+	// level after member overrides and fitting to the model.
+	SubagentEffort string `json:"subagentEffort,omitempty"`
+	// SubagentID is the Claude Code subagent whose turn this is
+	// (subagentTurnOf), the id the ledger's Subagent keeps too. Claude Code
+	// names no kind for it, so Kind stays empty and the Routing page tags
+	// it as Codex's subagents are.
+	SubagentID string `json:"subagentId,omitempty"`
 	// Nested: the rules of the groups in the group, down the way to the
 	// one that went first, each as it decided
 	Nested   []NestedRule `json:"nested,omitempty"`

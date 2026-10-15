@@ -366,10 +366,20 @@ files gets `Subagent` from the file's name, `<session>/subagents/agent-<id>.json
 or `<session>/subagents/workflows/<run>/agent-<id>.jsonl`
 (`sessions.SubagentOf`), so no cache version changes, and `ParentAgent` from
 the `parentAgentId` of the `agent-<id>.meta.json` beside it, which Claude Code
-writes for a subagent a subagent started (`sessions.SubagentParent`, read once
-a file; a meta file not read is unknown and read again). A gateway row matched
+writes for a subagent a subagent started (`sessions.SubagentParent`, through
+`ccMeta`: read once a file; a meta file not read is unknown and read again). A gateway row matched
 to a file row keeps the gateway's own. Both were checked against Claude Code
 2.1.296 spawning a subagent from a subagent.
+
+A folder these readers go into may be a link: a symlink, or on Windows a
+junction, which Go lists as irregular rather than as a folder or a symlink.
+Each reader that picks the entries it goes into (a Claude Code, Qoder or
+Cowork project folder, a session's own folder and a workflow run's, a Hermes
+profile, an Antigravity CLI conversation) asks `dirent.IsFolder`, which
+follows such an entry with `os.Stat`; none of them recurses through one. A
+walk root that is a link is walked where it leads, its files still named
+under the agent's folder (`walkLinked`, #2233). `TestIsFolder` and the
+`*BehindALink` tests make real links, junctions on Windows (#2268).
 
 Codex session identity is read from native thread metadata, rather than inferred
 from a shared session header or `Kind` (`x-openai-subagent`). The sessions API
@@ -379,6 +389,63 @@ known keeps an empty `root_session`; Codex entries without explicit identity
 metadata, gateway-only entries and conflicting identities set `role` to
 `unknown` and do not acquire a guessed parent or root. These fields are omitted
 for other agents. This is Codex-specific (#1591).
+
+A session whose agent keeps its subagents' conversations beside its own
+lists them in `subagents` on the sessions API (`/api/sessions`, `one`, `manage`; #2261,
+[`subagents.go`](../../internal/sessions/subagents.go)), only for agents with
+a transcript, oldest first. Each has `id`, `title` (the task it was given),
+`kind` (the agent it ran as), `parent` (the subagent that started it, empty
+for the session) and `start`/`last`; its file is never sent.
+
+- Claude Code, Qoder and Qoder CN: each `subagents/agent-<id>.jsonl` (and
+  under `workflows/<run>/`), with `agentType`, `description` and
+  `parentAgentId` from the meta file beside it (`ccMeta`). With no meta file
+  (Qoder), the title is the file's first user line (`ccTask`, at most 16
+  lines read). `agent-acompact-<id>.jsonl` is a compaction's own run and is
+  left out.
+- OpenCode: a child session (`parent_id`, from the JSON store or
+  `opencode.db`) is a subagent of its root, not a session of its own;
+  `ocRoots` records its parent. Its title splits 1.x's
+  `<description> (@<agent> subagent)`; 2.x titles it the description alone
+  (task tool, opencode 2.0.25), and a default `Child session - <time>` is no
+  title. ZCode shares the parser but has no transcript, so lists none.
+- Kimi Code: each `agents/agent-<n>/wire.jsonl`. 1.5's `subagent.spawned`
+  record, written in the starting agent's wire, gives `subagentName`,
+  `description` and `parentAgentId` (`kimiWireOf`, read again only when the
+  file's size or time changes); 1.4 writes none, and the title is the
+  subagent's first `turn.prompt`.
+
+These are read beside the parsed-session cache, not in it, so its version
+is unchanged. `GET /api/sessions/transcript` takes `sub=<id>` for a
+subagent's conversation; the id is looked up among the session's own
+`subagents` (`sessions.SubagentTranscript`), never used as a path, and one
+not listed is an error. See `TestClaudeSubagents`, `TestQoderSubagents`,
+`TestOpenCodeSubagents`, `TestKimiSubagents` and
+`TestSessionSubagentTranscript`.
+
+The Sessions page draws only main sessions on top. A session's subagents are
+folded under its row ("2 subagents"); unfolded, each is a row of its task and
+kind, set in under the subagent that started it, and a click shows its
+conversation (`sub=`). A Codex thread whose `parent_session` chain reaches a
+listed session is drawn, as a session with its own details, Resume and
+Delete, under its parent in the same fold; a loop of parents, a chain deeper
+than eight or a parent not listed leaves it on top. The folder's count and
+checkbox cover the sessions under others. See `sessions-subagents.test.cjs`.
+
+Codex keeps the existing session-title precedence. Only when that leaves the
+title empty may a child thread use its parent's `spawn_agent` `task_name`,
+matched by the same `call_id` and an `item_completed` event whose item has type
+`SubAgentActivity`, kind `started`, the same `id`, and the child's
+`agent_thread_id`. A legacy rollout (Codex's default history before paginated)
+keeps that started activity as an `event_msg` `sub_agent_activity` instead, its
+`event_id` the call id, and it links the same way. A link counts only from the
+file of the child's own parent (`parent_session`): a forked child's file
+repeats its parent's history, spawns of its siblings included, and that copy
+neither names a child nor takes a name away from one.
+The native top-level `session_meta.agent_nickname` is exposed separately as
+`nickname` on list, one, manage and overview responses; it does not replace the
+title. The parsed-session cache is versioned for nickname and task-title
+metadata, and the Codex-call cache for compaction, so older parses are rebuilt.
 
 `GET /api/sessions`, `/api/sessions/one` and `/api/sessions/manage` also return
 `model_effort` for each Codex thread, grouped by the canonical Usage ledger's
@@ -405,3 +472,16 @@ parent thread ID. `native_session` stays the recorded native header. The new
 `session_role` is omitted for other agents, whose existing field semantics stay
 unchanged. Ambiguous or unpaired calls do not inherit a relationship from shared
 session metadata.
+
+`GET /api/usage/requests` and `GET /v1/magpie/usage/requests` expose Codex
+`compaction` as `true` or `false` when a native Codex call establishes the
+marker state, and omit it when there is no matching native evidence. Only a
+call read from a `token_usage_record` (it has a `response_id`) establishes it:
+Codex writes that record and a compaction's `compaction_response_id` together,
+so a call told from `token_count` alone, in an older rollout, leaves it out
+rather than saying `false`. A unique
+`response_id` match adds this metadata to the gateway row while preserving that
+row's model, usage, cost and kind.
+Compaction is already included in Codex's total consumption, so this marker
+does not add tokens or cost. This is Codex-only; Claude behavior and the POST
+`/v1/magpie/usage/requests` ingest allowlist are unchanged.

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -33,6 +34,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/dirent"
+	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -119,6 +122,7 @@ type Session struct {
 	ID            string        `json:"id"`
 	Cwd           string        `json:"cwd"`
 	Title         string        `json:"title"` // the name it was given, else the agent's own title, else the first prompt
+	Nickname      string        `json:"nickname,omitempty"`
 	Start         time.Time     `json:"start"`
 	Last          time.Time     `json:"last"`
 	Role          string        `json:"role,omitempty"`
@@ -136,6 +140,9 @@ type Session struct {
 	Carry []Carry `json:"carry,omitempty"`
 	// Transcript says its conversation can be read (TranscriptOf)
 	Transcript bool `json:"transcript,omitempty"`
+	// Subagents are the conversations its agent started inside it, each
+	// read with SubagentTranscript (subagents.go)
+	Subagents []Subagent `json:"subagents,omitempty"`
 	// WSL is the WSL distro the session ran in, its files read through
 	// \\wsl.localhost (see wsl.go); "" for this computer's own
 	WSL string `json:"wsl,omitempty"`
@@ -173,6 +180,11 @@ type state struct {
 	ID                    string            `json:"id,omitempty"`
 	CodexIdentity         *CodexIdentity    `json:"codex_identity,omitempty"`
 	CodexIdentityConflict bool              `json:"codex_identity_conflict,omitempty"`
+	CodexNickname         string            `json:"codex_nickname,omitempty"`
+	CodexSpawnNames       map[string]string `json:"codex_spawn_names,omitempty"`
+	CodexSpawnConflicts   map[string]bool   `json:"codex_spawn_conflicts,omitempty"`
+	CodexAgentIDs         map[string]string `json:"codex_agent_ids,omitempty"`
+	CodexAgentConflicts   map[string]bool   `json:"codex_agent_conflicts,omitempty"`
 	Cwd                   string            `json:"cwd,omitempty"`
 	Title                 string            `json:"title,omitempty"`
 	Named                 string            `json:"named,omitempty"`  // the agent's own title for it
@@ -335,6 +347,10 @@ func (s *state) clone() *state {
 		t := *s.Total
 		c.Total = &t
 	}
+	c.CodexSpawnNames = maps.Clone(s.CodexSpawnNames)
+	c.CodexSpawnConflicts = maps.Clone(s.CodexSpawnConflicts)
+	c.CodexAgentIDs = maps.Clone(s.CodexAgentIDs)
+	c.CodexAgentConflicts = maps.Clone(s.CodexAgentConflicts)
 	c.Days = make(map[string]*day, len(s.Days))
 	for k, v := range s.Days {
 		d := &day{Active: v.Active, Models: make(map[string]Tokens, len(v.Models)), Prompts: v.Prompts, Replies: v.Replies}
@@ -363,9 +379,11 @@ type file struct {
 	main  bool // the session's own file, not a subagent's
 	size  int64
 	mod   time.Time
-	// OpenCode and ZCode: the session, and where it is kept
-	sid string
-	oc  ocStore
+	// OpenCode and ZCode: the session, and where it is kept; parent is
+	// the session that started it, "" for one the user did
+	sid    string
+	parent string
+	oc     ocStore
 	// Cline: the session's manifest, beside its messages; Grok Build: its
 	// summary.json, beside its updates; Droid: its settings, beside its
 	// transcript
@@ -407,7 +425,7 @@ func ccFiles(agent, dir string) []file {
 	projects := filepath.Join(dir, "projects")
 	var out []file
 	for _, project := range readDirectory(projects) {
-		if !project.IsDir() && project.Type()&os.ModeSymlink == 0 {
+		if !dirent.IsFolder(projects, project) {
 			continue
 		}
 		root := filepath.Join(projects, project.Name())
@@ -418,7 +436,7 @@ func ccFiles(agent, dir string) []file {
 				if stat(&f) {
 					out = append(out, f)
 				}
-			} else if e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+			} else if dirent.IsFolder(root, e) {
 				subs := filepath.Join(path, "subagents")
 				for _, sub := range readDirectory(subs) {
 					if sub.IsDir() || !strings.HasSuffix(sub.Name(), ".jsonl") {
@@ -430,7 +448,7 @@ func ccFiles(agent, dir string) []file {
 					}
 				}
 				for _, run := range readDirectory(filepath.Join(subs, "workflows")) {
-					if !run.IsDir() {
+					if !dirent.IsFolder(filepath.Join(subs, "workflows"), run) {
 						continue
 					}
 					dir := filepath.Join(subs, "workflows", run.Name())
@@ -502,12 +520,38 @@ const zstSuffix = ".zst"
 
 func codexFiles() []file { return codexFilesIn(CodexDir()) }
 
+// walkLinked is filepath.WalkDir over root, which can be a link to the
+// folder: the Codex CLI keeps .codex on another drive by making
+// ~/.codex/sessions a junction to it, and a symlink does the same
+// elsewhere. WalkDir lstat()s the root it is handed, where a link is no
+// folder at all, so it walked nothing behind it (#2233). It walks where
+// the link leads (proc.RealPath, since filepath.EvalSymlinks leaves a
+// junction as it is) and hands fn each path under root, not under the
+// link's target: an agent's folder is read back out of a session's path
+// (Codex's config.toml and state databases), and the target holds none
+// of it. A root that is no link is walked as it is.
+func walkLinked(root string, fn fs.WalkDirFunc) error {
+	walk := root
+	if fi, err := os.Lstat(root); err == nil && !fi.IsDir() {
+		if real, err := proc.RealPath(root); err == nil {
+			walk = real
+		}
+	}
+	return filepath.WalkDir(walk, func(p string, d fs.DirEntry, err error) error {
+		if walk != root {
+			if rel, err := filepath.Rel(walk, p); err == nil {
+				p = filepath.Join(root, rel)
+			}
+		}
+		return fn(p, d, err)
+	})
+}
+
 // codexFilesIn are the rollouts in a Codex folder.
 func codexFilesIn(dir string) []file {
 	var out []file
 	for _, folder := range []string{"sessions", "archived_sessions"} {
-		root := filepath.Join(dir, folder)
-		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		walkLinked(filepath.Join(dir, folder), func(p string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
 				return nil
 			}
@@ -580,7 +624,8 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 18: Claude Code's 1-hour cache writes apart from its 5-minute ones.
 // 19: the names the user gave Claude Code's and WorkBuddy's (custom-title).
 // 20: Codex's source and direct parent thread identity.
-const cacheVersion = 20
+// 21: Codex subagent nicknames and parent spawn task names.
+const cacheVersion = 21
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -976,12 +1021,14 @@ func List(limit int) []Session {
 	// after it has nothing left to do
 	refresh(files, files)
 	identities := codexIdentitySnapshot(files)
+	taskTitles := codexSubagentTaskTitles(files)
 
 	price := pricer()
 	out := []Session{}
 	for _, k := range keys {
 		if s, ok := assemble(groups[k], price); ok {
 			setSessionCodexIdentity(&s, identities)
+			setSessionCodexTaskTitle(&s, taskTitles)
 			out = append(out, s)
 			if len(out) == limit {
 				break
@@ -1032,6 +1079,9 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "omp" || s.Agent == "dsh" || s.Agent == "grok" || s.Agent == "droid") && st.ID != "" && f.path == fs[0].path {
 				s.ID = st.ID
 			}
+		}
+		if s.Agent == "codex" && st.CodexNickname != "" {
+			s.Nickname = st.CodexNickname
 		}
 		if !st.Start.IsZero() && (s.Start.IsZero() || st.Start.Before(s.Start)) {
 			s.Start = st.Start
@@ -1087,6 +1137,9 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 		s.Resume = resumeCommand(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
 	}
 	s.Carry, s.Transcript = carries(s), HasTranscript(s.Agent)
+	if s.Transcript {
+		s.Subagents = subagentsOf(s, fs)
+	}
 	return s, true
 }
 
@@ -1452,14 +1505,19 @@ func resumeCommand(distro, agent, id, cwd, path string) string {
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // Find is a session by agent and id: a listed one, else one Get finds
-// under agent:id.
+// under agent:id. One nothing was said in is found too, as ListAgent lists
+// it: the Sessions page shows it, and its conversation, Markdown and
+// Terminal open from it as from any other (#2273).
 func Find(agent, id string) (Session, bool) {
 	for _, s := range List(0) {
 		if s.Agent == agent && s.ID == id {
 			return s, true
 		}
 	}
-	if s, ok := Get(agent + ":" + id); ok && s.ID == id {
+	if s, ok, found := get(agent + ":" + id); found && s.ID == id {
+		if !ok {
+			listed(&s)
+		}
 		return s, true
 	}
 	return Session{}, false
@@ -1520,9 +1578,21 @@ func Titles(keys []string) map[string]string {
 		return out
 	}
 	refresh(fs, files)
+	parents := codexTaskParentFiles(fs, files)
+	if len(parents) > 0 {
+		refresh(parents, files)
+	}
+	titleFiles := append(append([]file(nil), fs...), parents...)
+	taskTitles := codexSubagentTaskTitles(titleFiles)
+	identities := codexIdentitySnapshot(fs)
 	price := pricer()
 	for k, g := range groups {
-		if s, ok := assemble(g, price); ok && s.Title != "" {
+		if s, ok := assemble(g, price); ok {
+			setSessionCodexIdentity(&s, identities)
+			setSessionCodexTaskTitle(&s, taskTitles)
+			if s.Title == "" {
+				continue
+			}
 			out[k] = s.Title
 		}
 	}
@@ -1532,6 +1602,13 @@ func Titles(keys []string) map[string]string {
 // Get is the session whose files are grouped under key (a Summary's Key),
 // however long ago it was at work.
 func Get(key string) (Session, bool) {
+	s, ok, _ := get(key)
+	return s, ok
+}
+
+// get is Get, and whether key has files at all: ok is false for a session
+// nothing was said in, which found still says is there.
+func get(key string) (s Session, ok, found bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
@@ -1544,9 +1621,10 @@ func Get(key string) (Session, bool) {
 		}
 	}
 	if len(fs) == 0 {
-		return Session{}, false
+		return Session{}, false, false
 	}
 	var identities map[string]CodexIdentity
+	var taskTitles map[codexTaskTitle]string
 	if strings.HasPrefix(key, "codex:") {
 		var codexFiles []file
 		for _, f := range files {
@@ -1556,10 +1634,12 @@ func Get(key string) (Session, bool) {
 		}
 		refresh(codexFiles, files)
 		identities = codexIdentitySnapshot(codexFiles)
+		taskTitles = codexSubagentTaskTitles(codexFiles)
 	} else {
 		refresh(fs, files)
 	}
-	s, ok := assemble(fs, pricer())
+	s, ok = assemble(fs, pricer())
 	setSessionCodexIdentity(&s, identities)
-	return s, ok
+	setSessionCodexTaskTitle(&s, taskTitles)
+	return s, ok, true
 }

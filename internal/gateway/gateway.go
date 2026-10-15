@@ -32,6 +32,7 @@ import (
 	"github.com/yetone/magpie/internal/awake"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/pluginrt"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/redact"
 	"github.com/yetone/magpie/internal/settings"
@@ -339,11 +340,11 @@ type Call struct {
 	// when it was on (archive.go); wire what it keeps besides
 	Archive string `json:"archive,omitempty"`
 	wire    *wire
-	// otelIn/otelOut are the whole bodies for the OTLP export when it asks
-	// for them uncut (#538): nil leaves it to the 256 KiB bodies above,
-	// which is all the Recent-calls page keeps
-	otelIn, otelOut       []byte
-	otelInCut, otelOutCut bool
+	// wholeIn/wholeOut are the whole bodies for an observer that asks for
+	// them uncut (the OTLP export, #538): nil leaves it to the 256 KiB
+	// bodies above, which is all the Recent-calls page keeps
+	wholeIn, wholeOut       []byte
+	wholeInCut, wholeOutCut bool
 }
 
 // Server is the gateway.
@@ -427,7 +428,7 @@ func (s *Server) RecentCall(id uint64) (Call, bool) {
 func (s *Server) record(c Call) {
 	// Whole bodies belong only to the export, never to the Recent-calls ring.
 	// This is a copy: the serving call still needs them for withBodies.
-	c.otelIn, c.otelOut = nil, nil
+	c.wholeIn, c.wholeOut = nil, nil
 	if c.wire != nil {
 		c.Archive = c.wire.name
 		archive(c)
@@ -471,8 +472,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	s.lnMu.Lock()
 	s.ln = ln
 	s.lnMu.Unlock()
-	stopOTel := usage.StartOTel()
-	defer stopOTel()
+	// the observers plugins registered (usage.Observer) run while this
+	// process serves, and plugins turned on or off elsewhere (the window,
+	// `magpie plugin builtin`) come and go here too
+	stopObservers := usage.ServeObservers()
+	defer stopObservers()
+	freshCtx, stopFresh := context.WithCancel(ctx)
+	defer stopFresh()
+	go pluginrt.KeepFresh(freshCtx, 2*time.Second, settings.Path(), provider.Path())
 	srv := &http.Server{Handler: lanGuard(s.Handler()), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
 	// the magpie serving the gateway, and only it, keeps the saved accounts
 	// signed in, so two never refresh one sign-in at once
@@ -1135,7 +1142,8 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	if sid, ok := provider.AutoStandIn(id); ok {
 		id = sid
 	}
-	if pick := desktopSubagentPick(r, agentOf(r), named, id, body); pick.Moved() {
+	pick := desktopSubagentPick(r, agentOf(r), named, id, body)
+	if pick.Moved() {
 		id = pick.To
 	}
 	p, model, ok := provider.Resolve(id)
@@ -1151,6 +1159,9 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	// and counts the unmasked one where generation sends that
 	if _, ms, isGroup := provider.FindGroup(id); ok && unredactedRoute(p, isGroup, ms) {
 		body = plain
+	}
+	if level := desktopSubagentEffort(r, agentOf(r), body, pick); level != "" && ok && !provider.Reasonless(p.ID, model) {
+		body = withFixedEffort(provider.Anthropic, body, fitLevel(level, p.Efforts(model)))
 	}
 	s.countOn(w, r, p, model, ok, body)
 }
@@ -1324,10 +1335,11 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 			// Codex compacts remotely, a compaction_trigger here, on a
 			// provider table named "OpenAI" (CC Switch's relay tables,
 			// which magpie points here, #1301): the summary is magpie's to
-			// make, as on CodexPath, and magpie's summaries go back as text
+			// make, as on CodexPath, and magpie's summaries go back as text;
+			// a provider set to compact natively is asked Codex's own (#1099)
 			if bytes.Contains(body, []byte(`"compaction`)) {
 				var compact bool
-				if body, compact = codexInput(body, true); compact {
+				if body, compact = codexInputAs(body, true, s.nativeCompactionFor(modelOf(body))); compact {
 					s.codexCompact(w, r, body)
 					return
 				}
@@ -1445,13 +1457,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	w, r, named := withMemberNames(w, r)
 	defer named()
 	requestBody, requestTruncated := captureRequestBody(body)
-	// the OTLP export may want the bodies uncut (#538): the request is
-	// already whole in memory, so keep it as it came, and the reply goes to
-	// a spool as it streams
-	wholeBodies := usage.OTelWhole()
-	var otelIn []byte
+	// an observer may want the bodies uncut (the OTLP export, #538): the
+	// request is already whole in memory, so keep it as it came, and the
+	// reply goes to a spool as it streams
+	wholeBodies := usage.ObservedBodies() == usage.WholeBodies
+	var wholeIn []byte
 	if wholeBodies {
-		otelIn = body
+		wholeIn = body
 	}
 	// a model asked for at an effort of its own (a Claude Code tier, #536)
 	// is the model, every try of it asked for that effort
@@ -1462,7 +1474,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	}
 	capture := &captureResponseWriter{ResponseWriter: w}
 	if wholeBodies {
-		capture.otel = &spool{limit: wholeBodyLimit, pattern: "magpie-otel-*"}
+		capture.whole = &spool{limit: wholeBodyLimit, pattern: "magpie-whole-*"}
 	}
 	w = capture
 	// the agent it is recorded as, the one on the computer it was passed
@@ -1472,10 +1484,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	metadata := requestSessionMetadata(r.Header, body)
 	var clientResponseID string // only a reply released to the client owns this ID
 	call := Call{Time: start, From: from, Model: unprefixed(modelOf(body)), Agent: who.agent, Via: who.via, Kind: requestCallKind(r.Header, metadata),
-		RequestBody: requestBody, RequestTruncated: requestTruncated, otelIn: otelIn, wire: archiving(r, capture, start, body)}
+		RequestBody: requestBody, RequestTruncated: requestTruncated, wholeIn: wholeIn, wire: archiving(r, capture, start, body)}
 	defer discardArchive(capture)
-	r, telemetry := beginOTelRequest(r, call.Kind, body)
-	defer func() { telemetry.end(call, time.Since(start).Milliseconds()) }()
+	r, watched := observeRequest(r, call.Kind, body)
+	defer func() { watched.end(call, time.Since(start).Milliseconds()) }()
 	switch call.Kind {
 	case "web_search":
 		call.For = searchFor(r.Context())
@@ -1486,10 +1498,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	finishCapture := func() {
 		call.ResponseBody = capture.body.text()
 		call.ResponseTruncated = capture.body.truncated
-		if capture.otel != nil {
-			call.otelOutCut = capture.otel.cut()
-			if b, err := capture.otel.read(); err == nil {
-				call.otelOut = b
+		if capture.whole != nil {
+			call.wholeOutCut = capture.whole.cut()
+			if b, err := capture.whole.read(); err == nil {
+				call.wholeOut = b
 			}
 		}
 	}
@@ -1572,12 +1584,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	if subagent == nil {
 		subagent = codexSubagentPick(r, agent, call.Kind, call.Model, body)
 	}
+	var desktopPick *SubagentPick
 	if subagent == nil {
-		subagent = desktopSubagentPick(r, agent, call.Model, asked, body)
+		desktopPick = desktopSubagentPick(r, agent, call.Model, asked, body)
+		subagent = desktopPick
 	}
 	if subagent.Moved() {
 		call.Model, asked = subagent.Asked, subagent.To
 	}
+	subagentEffort := desktopSubagentEffort(r, agent, body, desktopPick)
+	if subagentEffort != "" {
+		askedEffort = subagentEffort
+	}
+	// any Claude Code subagent's turn, moved or not, for the Routing page's tag
+	subagentID := subagentTurnOf(r, call.Kind, body, desktopPick != nil || subagentEffort != "")
 	p, model, ok := provider.Resolve(asked)
 	// a model the user disabled (#1867) — asked by its id, the model a
 	// sub-agent was put on, a group with every model in it disabled — is
@@ -1822,14 +1842,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// a conversation's affinity is to one model: another's cache is its
 	// own, and an agent's side requests (a title, a summary) to a smaller
 	// model leave the conversation where it is
-	scope, mode, rotate := p.ID+"/"+model, p.Affinity, p.Routing == provider.Rotate
+	scope, mode, rotate := p.ID+"/"+model, p.Affinity, routingOf(p.Routing) == provider.Rotate
 	leadScope := scope // where the lead of a subagent is kept
 	if isGroup {
 		// a routing group: every member's keys or accounts weighed together
 		cands, pl = s.planGroup(g, ms, from)
 		group = groupRef(g, ms)
 		group.Paused = paused
-		scope, mode, rotate = provider.GroupPrefix+g.ID, g.Affinity, g.Routing == provider.Rotate
+		scope, mode, rotate = provider.GroupPrefix+g.ID, g.Affinity, routingOf(g.Routing) == provider.Rotate
 		leadScope = scope
 		if words != "" {
 			// a subagent a rule sends elsewhere mustn't take its agent's
@@ -1848,6 +1868,32 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	agentPick := provider.AgentEffort(agent)
 	if sealedTask {
 		cands, pl = s.sealedReaders(cands, pl, sealers)
+	}
+	// a compaction a provider set to compact natively sealed goes only to
+	// the key or account that sealed it, or is refused saying so: never
+	// to another, to be refused, dropped or summarised (#1099). Codex's
+	// trigger goes only where it can be asked as Codex sent it.
+	var checkpoint *checkpointWriter
+	if from == provider.Responses {
+		if cp, ok := checkpointOf(body); ok {
+			checkpoint = &cp
+			var left bool
+			if cands, pl, left = checkpointReaders(cands, pl, cp.Who); !left {
+				call.Status, call.Error = 400, "native compaction sealed elsewhere"
+				writeError(w, from, 400, checkpointError(call.Model, cp))
+				turnedAway()
+				return
+			}
+		}
+		if compactionTriggerIn(body) {
+			var left bool
+			if cands, pl, left = s.compactionCarriers(cands, pl); !left {
+				call.Status, call.Error = 400, "native compaction not carried"
+				writeError(w, from, 400, carrierError(call.Model))
+				turnedAway()
+				return
+			}
+		}
 	}
 	var accountHeld bool // every candidate was an account or key the calling key may not use
 	if keyHeld || accHeld {
@@ -2046,9 +2092,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		capture.tools = tools
 	}
 	tierAsked := bodyTier(from, body) // the service tier the client asked for (#1784)
-	tr := s.trace.beginFor(r, Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pin, Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Subagent: subagent, Sub: subOf(r.Header), Affinity: shown, Order: pl.order, Left: pl.left})
-	if telemetry != nil {
-		telemetry.routeID = tr.ID
+	tr := s.trace.beginFor(r, Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pin, Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Subagent: subagent, SubagentEffort: subagentEffort, Sub: subOf(r.Header), SubagentID: subagentID, Affinity: shown, Order: pl.order, Left: pl.left})
+	if watched != nil {
+		watched.routeID = tr.ID
 	}
 	// the card's text is the masked body, even where the request went
 	// unmasked
@@ -2100,6 +2146,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// and the provider's last answer, saved to disk, took seconds on a busy
 	// disk, and the reply's speed counted them as its own)
 	var ended time.Time
+	// the compaction a provider set to compact natively seals, read on the
+	// way to Codex, and who sealed it remembered once it has answered
+	// (#1099)
+	var sealedBy *candidate
+	if from == provider.Responses && compactionTriggerIn(body) {
+		watch := &compactionWatch{w: w}
+		w = watch
+		defer func() {
+			if sealedBy != nil {
+				if enc := watch.sealed(); enc != "" {
+					wroteCheckpoint(enc, *sealedBy)
+				}
+			}
+		}()
+	}
 	for i := 0; i < len(cands); i++ {
 		c := cands[i]
 		if j := s.laneMate(cands, i, isGroup, gaveWay); j > i {
@@ -2140,9 +2201,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// (#1359)
 			hw.loop = &loopGuard{}
 		}
-		if isGroup && g.FirstToken > 0 && !last && streams {
+		// a member of a group in the group is timed by the innermost
+		// group that sets a FirstToken (#2246), else by the group asked for
+		firstToken := cmp.Or(c.firstToken, g.FirstToken)
+		if isGroup && firstToken > 0 && !last && streams {
 			// slow to start, the next member is asked (Group.FirstToken)
-			hw.firstWait = time.Duration(g.FirstToken) * time.Second
+			hw.firstWait = time.Duration(firstToken) * time.Second
 		}
 		call.Provider, call.To, call.Usage = c.p.ID, "", Usage{}
 		model = c.model
@@ -2525,7 +2589,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// the agent went away: nobody failed, and nobody else is asked
 			call.Status, call.Error = 499, "the agent canceled the request"
 			try.Status, try.Error, try.Fail = call.Status, call.Error, failCanceled
-			telemetry.attempt(call, try, c.p.ID, sent, hw, capture)
+			watched.attempt(call, try, c.p.ID, sent, hw, capture)
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			break
 		}
@@ -2533,10 +2597,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// no first content in the group's FirstToken, and nothing of
 			// it sent: the next member is asked, and this one doesn't
 			// rest, a long prompt being slow to start anywhere
-			call.Status, call.Error = http.StatusGatewayTimeout, fmt.Sprintf("%s: no first token in %ds", c.p.Name, g.FirstToken)
+			call.Status, call.Error = http.StatusGatewayTimeout, fmt.Sprintf("%s: no first token in %ds", c.p.Name, firstToken)
 			try.Status, try.Error, try.Fail = call.Status, call.Error, failSlow
 			call.TTFT, call.FirstText, call.Flow, call.FirstReasoning = 0, 0, 0, 0
-			telemetry.attempt(call, try, c.p.ID, sent, hw, capture)
+			watched.attempt(call, try, c.p.ID, sent, hw, capture)
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			if other == nil {
 				other = &Try{Status: call.Status, Error: call.Error}
@@ -2544,7 +2608,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			skipped = append(skipped, c.label()+": "+call.Error)
 			continue
 		}
-		telemetry.attempt(call, try, c.p.ID, sent, hw, capture)
+		watched.attempt(call, try, c.p.ID, sent, hw, capture)
 		if autoPicks(c) && repicked < 2 && !hw.passing && hw.code() == http.StatusBadRequest &&
 			(provider.CopilotRefusal(hw.errBody()) || wrongEndpoint(hw.code(), hw.errBody())) {
 			// Copilot refused the model its Auto picked, and Auto has
@@ -2570,7 +2634,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					refused(stuck, c.who(), attemptBody, "reasoning")
 				}
 			}
-			if !ok {
+			// a compaction sealed where native compaction is on is never
+			// left out: its writer's refusal goes back as it came (#1099)
+			if !ok && checkpoint == nil && !s.compactsNatively(c.p, c.model) {
 				resealed = 2
 				if b, ok = withoutCompaction(body); ok {
 					refused(stuck, c.who(), attemptBody, compactionKinds...)
@@ -2641,8 +2707,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				// what this account answered is its refusal, the reply
 				// captured so far being no one's yet
 				refusal := &Call{RequestBody: call.RequestBody, RequestTruncated: call.RequestTruncated, ResponseBody: string(hw.errBody())}
-				if call.otelIn != nil {
-					refusal.otelIn, refusal.otelOut = call.otelIn, hw.errBody()
+				if call.wholeIn != nil {
+					refusal.wholeIn, refusal.wholeOut = call.wholeIn, hw.errBody()
 				}
 				withBodies(&rec, refusal)
 				appendUsage(r, rec)
@@ -2685,8 +2751,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				// what this account answered is its refusal, the reply
 				// captured so far being no one's yet
 				refusal := &Call{RequestBody: call.RequestBody, RequestTruncated: call.RequestTruncated, ResponseBody: string(hw.errBody())}
-				if call.otelIn != nil {
-					refusal.otelIn, refusal.otelOut = call.otelIn, hw.errBody()
+				if call.wholeIn != nil {
+					refusal.wholeIn, refusal.wholeOut = call.wholeIn, hw.errBody()
 				}
 				withBodies(&rec, refusal)
 				appendUsage(r, rec)
@@ -3043,7 +3109,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// a compaction a rule sent to a model of its own leaves the
 			// conversation, and the turn's size, where they were
 			if hit == nil || !hit.Compact {
-				answered(stuck, c, aff.Turn, call.Usage.CacheRead, call.Usage.CacheWrite)
+				answered(stuck, c, aff.Turn, call.Usage)
+			}
+			if s.compactsNatively(c.p, c.model) {
+				sealedBy = &c
 			}
 			if hit != nil && !hit.Compact {
 				ruleAnswered(ruleAt, call.Usage)
@@ -3237,7 +3306,8 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// (the provider is always streamed on that path) rather than relayed,
 	// except a plugin's on Responses, which is relayed streamed and given
 	// back whole (gathers)
-	relay := slices.Contains(s.usable(p, model), from) && (p.Account == nil || !p.Account.Stream || streamOf(body) || gathers(p, from, body))
+	relayable := slices.Contains(s.usable(p, model), from) && (p.Account == nil || !p.Account.Stream || streamOf(body) || gathers(p, from, body))
+	relay := relayable
 	// a Claude model is asked on Messages whatever API the client spoke,
 	// for the cache breakpoints the translation adds: OpenCode speaks Chat
 	// for every model, and a relay drops cache_control on Chat, so every
@@ -3279,12 +3349,23 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	if relay && from == provider.Chat && !streamOf(body) && dashScope(p) {
 		relay, ownAPI = false, true
 	}
+	// Codex's compaction trigger, or a compaction sealed where native
+	// compaction is on, goes as it came: a translation would leave it out
+	// (#1099)
+	keep := s.keepsCompaction(from, p, model, body)
+	if keep && relayable {
+		relay, ownAPI = true, false
+	}
 	if relay {
 		call.To = from
 		if status, msg, done := s.passthrough(w, r, p, from, model, body, &call.Usage); done {
 			return status, msg
 		}
 		// the model isn't served on the client's own API: speak another
+	}
+	if keep {
+		msg := fmt.Sprintf("%s doesn't serve %s on the Responses API, so Codex's native compaction can't be asked of it", p.Name, model)
+		return writeError(w, from, 400, msg), msg
 	}
 	to := s.usable(p, model)
 	if len(to) == 0 {

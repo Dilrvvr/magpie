@@ -344,6 +344,7 @@ func logRecord(c sessions.Call) Record {
 		Millis: c.Millis, TTFT: c.TTFT, Session: c.Session, RequestID: c.RequestID, Error: c.ErrorText, ErrType: c.Error, Subagent: sessions.SubagentOf(c.File), ParentAgent: sessions.SubagentParent(c.File)}
 	if c.Agent == "codex" {
 		r.ResponseID = c.ResponseID
+		r.Compaction = codexCompactionOf(c)
 	}
 	if c.Agent == "codex" || c.Agent == "opencode" {
 		r.Requested, r.Served = c.Model, ""
@@ -359,11 +360,11 @@ func logRecord(c sessions.Call) Record {
 // and an end within 2s. Fallback matches must be unique in both logs: an
 // ambiguous direct call stays visible. One gateway entry consumes one file call.
 func gatewayMatches(recs []Record, logs []sessions.Call) map[int]bool {
-	matched, _, _ := gatewayMatchesDetails(recs, logs)
+	matched, _, _, _ := gatewayMatchesDetails(recs, logs)
 	return matched
 }
 
-func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, map[int]int, map[int]string) {
+func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, map[int]int, map[int]string, map[int]*bool) {
 	gateway, local := &rowChunk{}, &rowChunk{}
 	for i, r := range recs {
 		r.Agent = ReportedAs(r.Agent)
@@ -374,7 +375,7 @@ func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, m
 		r.Agent = c.Agent // the native log already names its agent
 		local.add(Row{Record: r, codexActor: codexActor(c)}, c.Msg, int64(i), c.Error != "")
 	}
-	duplicates, actors := duplicateCodexCalls(logs)
+	duplicates, actors, compactions := duplicateCodexCalls(logs)
 	pairs := codexResponseMatches(recs, logs, duplicates)
 	deduplicate := map[rowRef]bool{}
 	for index := range duplicates {
@@ -391,7 +392,7 @@ func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, m
 	for index := range duplicates {
 		matched[index] = true
 	}
-	return matched, pairs, actors
+	return matched, pairs, actors, compactions
 }
 
 func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) (rows []Row, sum Totals, agents, providers []string) {
@@ -402,19 +403,19 @@ func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) 
 // priced and judged here as this computer's are, and none from until on (a
 // picked range's end, #1492; zero for none).
 func ledgerWithShared(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall) (rows []Row, sum Totals, agents, providers []string) {
-	matched, pairs, actors := gatewayMatchesDetails(recs, logs)
-	return ledgerMatched(since, until, f, recs, logs, others, matched, pairs, actors)
+	matched, pairs, actors, compactions := gatewayMatchesDetails(recs, logs)
+	return ledgerMatched(since, until, f, recs, logs, others, matched, pairs, actors, compactions)
 }
 
 // ledgerMatched is ledgerWithShared with the session files' calls the
 // gateway saw already told (matched, by their index in logs).
-func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool, pairs map[int]int, actors map[int]string) (rows []Row, sum Totals, agents, providers []string) {
+func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool, pairs map[int]int, actors map[int]string, compactions map[int]*bool) (rows []Row, sum Totals, agents, providers []string) {
 	renamed := provider.Renamed()
 	// the upstream names in force now, read once for the lot: a row is
 	// judged by the names standing today, which is what Ledger says, and
 	// the rows here are what a reader compares a bill against
 	wires := settings.Load().ModelWires
-	priceOf := pricer()
+	priceOf := Pricer()
 	codexIdentities := sessions.CodexIdentities()
 	rows = make([]Row, 0, len(recs)+len(logs))
 	agents, providers = []string{}, []string{}
@@ -457,6 +458,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 			if override, ok := actors[call]; ok {
 				actor = override
 			}
+			r.Compaction = compactions[call]
 		}
 		add(r, priceOf(r), r.Source, actor)
 	}
@@ -467,6 +469,9 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		// Session identity does not establish a billing provider; price the
 		// record through the same lookup without inferring one from the account.
 		r := logRecord(c)
+		if metadata, ok := compactions[i]; ok {
+			r.Compaction = metadata
+		}
 		actor := codexActor(c)
 		if override, ok := actors[i]; ok {
 			actor = override
@@ -493,12 +498,12 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 	return rows, sum, agents, providers
 }
 
-// ownPrice is what pricer answers for a reported call that said what it
+// ownPrice is what Pricer answers for a reported call that said what it
 // cost: a price, so the call counts as priced, which Record.CostAt passes
 // over for the call's own cost.
 var ownPrice catalog.Price
 
-// pricer uses the same effective price as the model CLI and session totals:
+// Pricer uses the same effective price as the model CLI and session totals:
 // explicit provider/model or provider-wide prices (including zero), then the
 // provider catalog, then the maker catalog. Settings are read once per query.
 //
@@ -508,7 +513,7 @@ var ownPrice catalog.Price
 // is listed (#1498). The model asked for keeps its own price whenever it
 // has one, a zero set by the user included, so a ledger that matched the
 // vendor's bill still does.
-func pricer() func(Record) *catalog.Price {
+func Pricer() func(Record) *catalog.Price {
 	prices := map[[3]string]*catalog.Price{}
 	s := settings.Load()
 	return func(r Record) *catalog.Price {
@@ -542,7 +547,7 @@ func pricer() func(Record) *catalog.Price {
 // effective prices used by the ledger. Reuse it for one page of routes;
 // make it again on the next read so a changed tariff re-prices history.
 func NewPricer() func([]Record) Totals {
-	priceOf, renamed := pricer(), provider.Renamed()
+	priceOf, renamed := Pricer(), provider.Renamed()
 	return func(recs []Record) Totals {
 		var sum Totals
 		for _, r := range recs {
@@ -1028,7 +1033,7 @@ func Visit(since time.Time, fn func(Record)) { readLogSnapshot().visit(since, fn
 // ledger uses, read once: its cost in USD, and false for a call with
 // tokens but no known price.
 func NewCoster() func(Record) (float64, bool) {
-	priceOf, renamed := pricer(), provider.Renamed()
+	priceOf, renamed := Pricer(), provider.Renamed()
 	return func(r Record) (float64, bool) {
 		if id, ok := renamed[r.Provider]; ok {
 			r.Provider = id

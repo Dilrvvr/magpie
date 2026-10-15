@@ -35,7 +35,11 @@ import (
 // what a search found.
 const searchRounds = 6
 
-const searchTimeout = 2 * time.Minute
+// searchTimeout is how long a search's vendor has to answer; a model's
+// search (modelSearch) has it from when its request went out, each try's
+// own, and searchWaitMost in all, its waits for a slot or a resting
+// provider with it (sideDeadline, #2318).
+const searchTimeout, searchWaitMost = 2 * time.Minute, 5 * time.Minute
 
 // searchingKey marks a search magpie asks for itself, which must not
 // search by way of another model again.
@@ -586,7 +590,7 @@ const searchersInTurn = 3
 
 // modelSearch searches the web with the searcher's model; one magpie
 // picked that fails or finds nothing gives way to the next searcher magpie
-// would pick, all of them within searchTimeout. One Settings names gives
+// would pick, all of them within searchWaitMost. One Settings names gives
 // way to none: the search APIs, when set up, search in its place
 // (webSearch), and Settings says it didn't search (SearcherFailed). Handed
 // on, a search for Grok, picked, went to Codex's gpt-6-astra, a pricier
@@ -596,7 +600,7 @@ func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, 
 	if !ok {
 		return "", nil, errNoSearcher
 	}
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, searchingKey{}, true), searchTimeout)
+	ctx, cancel := sideDeadline(context.WithValue(ctx, searchingKey{}, true), "search", searchTimeout, searchWaitMost)
 	defer cancel()
 	type pick struct{ id, model string }
 	tried := []pick{{p.ID, model}}
@@ -727,7 +731,7 @@ func searcherSpent(p provider.Provider, model string) error {
 	}
 	when := ""
 	if !back.IsZero() {
-		when = " until " + back.Local().Format("Jan 2 15:04")
+		when = " until " + heldClock(back, time.Now())
 	}
 	return fmt.Errorf("%s/%s: out of its allowance%s, not asked", p.ID, model, when)
 }
@@ -802,8 +806,8 @@ func (s *Server) searchWith(ctx context.Context, p provider.Provider, model, que
 		if out.Error != nil && out.Error.Message != "" {
 			msg = out.Error.Message
 		}
-		if ctx.Err() != nil {
-			msg = "no answer in " + searchTimeout.String()
+		if t, ok := sideTimeout(ctx); ok {
+			msg = t.Error()
 		}
 		return "", nil, fmt.Errorf("%s/%s: %s", p.ID, model, msg)
 	}
@@ -934,6 +938,13 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 		mine, theirs, gap := false, false, said
 		var stop string
 		for ev := range in {
+			if ev.Kind == KAlive {
+				// nothing of the reply: no part of what it collects
+				if !send(ev) {
+					return
+				}
+				continue
+			}
 			col.add(ev)
 			switch ev.Kind {
 			case KStart:
@@ -1084,15 +1095,25 @@ func (s *Server) askTranslated(p provider.Provider, to provider.Protocol, model 
 				}
 			}
 			var failed error
-			err := readSSE(rd, func(_, data string) error {
+			told := time.Now() // when the reader was last sent anything
+			err := readSSEAlive(rd, func(_, data string) error {
 				if err := dec(data, func(ev Event) {
 					if failed == nil {
 						failed = send(ev)
+						told = time.Now()
 					}
 				}); err != nil {
 					return err
 				}
 				return failed
+			}, func() {
+				// a provider still queued or thinking — keepalives,
+				// response.in_progress — is heard from with nothing to
+				// translate: the reader hears that it goes on (#2316)
+				if failed == nil && time.Since(told) >= keepaliveGap {
+					failed = send(Event{Kind: KAlive})
+					told = time.Now()
+				}
 			})
 			if err != nil && failed == nil && ctx.Err() == nil {
 				send(Event{Kind: KError, Text: p.Name + ": " + err.Error()})

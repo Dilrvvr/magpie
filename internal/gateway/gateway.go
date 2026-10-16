@@ -305,7 +305,10 @@ func Taken() bool {
 type Call struct {
 	// ID numbers the call in the Recent-calls ring, from 1, for the page
 	// to ask for its bodies by (the ring's summary leaves them out, #1521)
-	ID    uint64    `json:"id,omitempty"`
+	ID uint64 `json:"id,omitempty"`
+	// Route: the Routing page's request (Route.ID) this call is, for it
+	// to ask for the call's bodies by while the ring still has them
+	Route int64     `json:"route,omitempty"`
 	Time  time.Time `json:"time"`
 	Agent string    `json:"agent"`         // who called, from the client's User-Agent
 	Via   string    `json:"via,omitempty"` // the computer a remote magpie's request came from (AgentHeader)
@@ -418,6 +421,19 @@ func (s *Server) Recent() []Call {
 		out[len(s.recent)-1-i] = c
 	}
 	return out
+}
+
+// RouteCall is the call the Routing page's request route was, while it is
+// still in the ring.
+func (s *Server) RouteCall(route int64) (Call, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.recent) - 1; i >= 0; i-- {
+		if route != 0 && s.recent[i].Route == route {
+			return s.recent[i], true
+		}
+	}
+	return Call{}, false
 }
 
 // RecentCall is the call numbered id while it is still in the ring.
@@ -3288,7 +3304,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			t.Served, t.Swapped, t.Routed = t.Tries[n-1].Served, t.Tries[n-1].Swapped, t.Tries[n-1].Routed
 			t.Upstream = t.Tries[n-1].Upstream
 		}
+		t.Archive = call.archiveName()
 	})
+	call.Route = tr.ID
 	s.record(call)
 	if call.To != "" {
 		rec := usage.Record{RouteID: tr.ID, Time: start, Agent: call.Agent, Via: call.Via, Provider: call.Provider, Host: where, Model: model,
@@ -4391,6 +4409,27 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	buf := make([]byte, 32<<10)
 	var rerr error
+	// atLine says whether what the client has ends a line, so what is
+	// appended below begins one of its own: appended after a line still
+	// pending, an event's name lands inside that line's data, and the
+	// client reads one event it can't parse where the protocol's error was
+	// meant (TestPassthroughStreamCutMidLine)
+	atLine := true
+	write := func(b []byte) (int, error) {
+		if len(b) > 0 {
+			atLine = b[len(b)-1] == '\n'
+		}
+		return w.Write(b)
+	}
+	// apart is what goes before an event magpie appends: a blank line,
+	// after the line still pending if the upstream's last write stopped
+	// inside one
+	apart := func() []byte {
+		if atLine {
+			return []byte("\n")
+		}
+		return []byte("\n\n")
+	}
 	for {
 		n, err := rd.Read(buf)
 		if n > 0 {
@@ -4420,7 +4459,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			if phases != nil {
 				out = phases.write(out)
 			}
-			if _, werr := w.Write(out); werr != nil {
+			if _, werr := write(out); werr != nil {
 				return res.StatusCode, "", true
 			}
 			if f != nil {
@@ -4448,39 +4487,39 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		if written != nil {
 			out = append(written.write(out), written.flush()...)
 		}
-		w.Write(sign(out))
+		write(sign(out))
 	} else if written != nil {
-		w.Write(sign(written.flush()))
+		write(sign(written.flush()))
 	}
 	if whole != nil {
 		out := whole.flush()
 		if spaces != nil {
 			out = spaces.write(out)
 		}
-		w.Write(sign(out))
+		write(sign(out))
 	}
 	if search != nil {
 		out := search.flush()
 		if spaces != nil {
 			out = spaces.write(out)
 		}
-		w.Write(sign(out))
+		write(sign(out))
 	}
 	if spaces != nil {
-		w.Write(sign(spaces.flush()))
+		write(sign(spaces.flush()))
 	}
 	if ints != nil {
 		b := ints.flush()
 		if sigs != nil {
 			b = sigs.write(b)
 		}
-		w.Write(out(b))
+		write(out(b))
 	}
 	if sigs != nil {
-		w.Write(out(sigs.flush()))
+		write(out(sigs.flush()))
 	}
 	if phases != nil {
-		w.Write(phases.flush())
+		write(phases.flush())
 	}
 	if sse {
 		sniff.drain()
@@ -4493,23 +4532,41 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		status, msg := gather.finish(client, p, sse, cut, sniff.failed)
 		return status, msg, true
 	}
-	if sse && r.Context().Err() == nil && !sniff.whole() {
+	// a Chat stream of Gemini's OpenAI-compatible API is whole only with
+	// its finish_reason, [DONE] or not (saysItsEnd)
+	unfinished := proto == provider.Chat && sniff.failed == "" && sniff.u.Stop == "" && saysItsEnd(p, proto, upstream)
+	if fin := sniff.tail.finish(); sse && unfinished && fin != "" && (rerr == nil || rerr == io.EOF) && r.Context().Err() == nil {
+		// only the finish_reason was lost, after the generation was done
+		// (chatTail): the client gets it, and the reply is whole
+		w.Write(append(apart(), "data: "+string(finishChunk(fin))+"\n\n"...))
+		if !sniff.ended {
+			w.Write([]byte("data: [DONE]\n\n"))
+		}
+		if f != nil {
+			f.Flush()
+		}
+		sniff.u.Stop, unfinished = fin, false
+	}
+	if sse && r.Context().Err() == nil && (!sniff.whole() || unfinished) {
 		// the upstream died mid-reply, or ended it short of its last
 		// event: say so in the stream rather than end it as if whole,
 		// which a client reads as a reply cut off for no reason (#370:
 		// dsh's "stream ended before message_stop", not retried). A Chat
 		// stream may end without [DONE] and be whole, so only a read that
-		// failed counts there; a Gemini one ends on a candidate's
-		// finishReason (#1644).
+		// failed counts there, Gemini's own aside; a Gemini one ends on a
+		// candidate's finishReason (#1644).
 		var failed string
 		switch {
 		case rerr != nil && rerr != io.EOF:
 			failed = cutMidReply(p.Name, rerr)
-		case proto == provider.Anthropic || proto == provider.Responses || proto == provider.Gemini:
-			failed = p.Name + ": the reply ended before it was complete"
+		case proto == provider.Anthropic || proto == provider.Responses || proto == provider.Gemini || unfinished:
+			failed = p.Name + ": " + errEndedShort.Error()
 		}
 		if failed != "" {
-			w.Write(streamFailure(proto, failed))
+			// what is appended begins after a blank line: the event still
+			// pending is left to stand, and the failure is read as an
+			// event of its own (TestPassthroughStreamEndsOnLineEnd)
+			w.Write(append(apart(), streamFailure(proto, failed)...))
 			if f != nil {
 				f.Flush()
 			}
@@ -5416,12 +5473,19 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	}
 	var col collector
 	ended := false // the upstream said its reply ended
+	var tail chatTail
 	see, held := written(zenSee(zen, col.add))
 	err = readSSE(rd, func(_, data string) error {
+		tail.see([]byte(data))
 		u.add(Usage{Upstream: upstreamOf([]byte(data)), Tier: upstreamTier([]byte(data))})
 		ended = ended || replyEnds(actual, data, upstreamStop([]byte(data)))
 		return dec(data, see)
 	})
+	if fin := tail.finish(); err == nil && !ended && actual == provider.Chat && fin != "" && saysItsEnd(p, actual, model) {
+		// Gemini's OpenAI-compatible API lost only the finish_reason
+		// after its generation was done (chatTail)
+		ended, err = true, dec(string(finishChunk(fin)), see)
+	}
 	held()
 	if err != nil {
 		// a partial answer is not an answer
@@ -5439,7 +5503,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		// the vendor failing
 		return writeVendorError(w, from, cmp.Or(col.errStatus, 502), p.Name+": "+said, col.errSaid), said
 	}
-	if col.err == "" && !ended && (actual == provider.Anthropic || actual == provider.Responses || geminiKin(actual)) && r.Context().Err() == nil {
+	if col.err == "" && !ended && saysItsEnd(p, actual, model) && r.Context().Err() == nil {
 		// an Anthropic stream that just stopped — no stop_reason, no
 		// message_stop — or a Responses one with no response.completed is
 		// a reply cut short, not a finished one, as a streaming client is
@@ -6365,7 +6429,10 @@ func writeErrorSaid(w http.ResponseWriter, proto provider.Protocol, status int, 
 		typ = "permission_error"
 	case status == 404:
 		typ = "not_found_error"
-	case status == 413 && proto == provider.Anthropic:
+	case status == 413:
+		// Anthropic's own type, in every shape: pi (overflow.ts) compacts
+		// and tries once more on it, and an OpenAI-shaped api_error left
+		// it stopped (@wilsonxuuuu on X)
 		typ = "request_too_large"
 	case status == 429:
 		typ = "rate_limit_error"
@@ -6418,9 +6485,11 @@ func writeErrorSaid(w http.ResponseWriter, proto provider.Protocol, status int, 
 // Kimi's "exceeded model token limit", DS4's "configured context size",
 // z.ai's "Prompt too long" / "Prompt exceeds max length" and
 // model_context_window_exceeded, Ollama's "exceeded max context length",
-// DashScope's "Range of input length should be", "token limit exceeded".
+// DashScope's "Range of input length should be", "token limit exceeded",
+// a relay's own cap on one request's input, "Input token exceed the limit"
+// (#2445: B.ai, under the model's window, which another member holds).
 var tooLongRe = regexp.MustCompile(`(?i)context_length_exceeded|prompt is too long|input is too long|(exceeds?|exceeded|over|beyond)( the)?( model'?s?)?( maximum)? context|context (length|limit|window) (exceeded|is exceeded)|maximum context length|too many (input |prompt )?tokens|上下文(长度)?(超|过长)|超(过|出)(了)?(模型)?(的)?(最大)?上下文` +
-	`|input token count.*exceeds the maximum|maximum prompt length is \d|reduce the length of the messages|maximum allowed input length|longer than the model'?s context length|available context size|greater than the context length|prompt token count of [\d,]+ exceeds the limit|context window exceeds limit|exceeded model token limit|configured context size|prompt too long|prompt exceeds max length|context_window_exceeded|exceeded (max |maximum )?context length|range of input length should be|token limit exceeded`)
+	`|input token count.*exceeds the maximum|maximum prompt length is \d|reduce the length of the messages|maximum allowed input length|longer than the model'?s context length|available context size|greater than the context length|prompt token count of [\d,]+ exceeds the limit|context window exceeds limit|exceeded model token limit|configured context size|prompt too long|prompt exceeds max length|context_window_exceeded|exceeded (max |maximum )?context length|range of input length should be|token limit exceeded|input tokens? (count )?(exceeds?|exceeded) (the )?(max(imum)? )?limit`)
 
 // overflowed says a refused request was too long for the model — a
 // request error (400, 413, 422) whose words say so.

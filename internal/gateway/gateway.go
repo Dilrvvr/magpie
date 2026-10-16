@@ -682,7 +682,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusNotFound, "magpie serves /v1/chat/completions, /v1/responses, /v1/messages, /v1/systemone, /v1/images/generations, /v1/images/edits, /v1/videos, /v1/embeddings, /v1/rerank, /v1/audio/transcriptions, /v1/audio/translations and /v1beta/models/*")
 	})
-	return s.counted(corsGuard(callerGuard(withCaller(keyLimited(mux)))))
+	return s.counted(holdCatalog(corsGuard(callerGuard(withCaller(keyLimited(mux))))))
 }
 
 // responsesOverHTTP answers a GET on /v1/responses, which is how a client
@@ -937,14 +937,19 @@ func nativeEndpoints(e provider.Entry) []string {
 // drawerObjects are the image models magpie draws with, as another magpie
 // asks for them in its list (provider.DrawersHeader): "kind": "image",
 // which an agent's list never has, so it takes none for a model to chat
-// with.
-func drawerObjects() []map[string]any {
+// with. A gateway key held to some models is told of those alone, as its
+// chat list is.
+func drawerObjects(r *http.Request) []map[string]any {
+	who, held := keyHolds(r)
 	var out []map[string]any
 	for _, p := range provider.All() {
 		if !p.On() || p.DecideOnly() {
 			continue
 		}
 		for _, m := range Drawers(p) {
+			if held && !modelAllowed(who, p, m.ID) {
+				continue
+			}
 			name := cmp.Or(m.Name, m.ID)
 			o := map[string]any{"id": p.ID + "/" + m.ID, "object": "model", "type": "model", "kind": "image", "created": 0,
 				"owned_by": p.ID, "display_name": name, "magpie_label": name + " · " + p.Name,
@@ -960,13 +965,18 @@ func drawerObjects() []map[string]any {
 
 // videomakerObjects are the video models magpie makes videos with, as
 // another magpie asks for them (provider.VideomakersHeader): "kind": "video".
-func videomakerObjects() []map[string]any {
+// A gateway key held to some models is told of those alone.
+func videomakerObjects(r *http.Request) []map[string]any {
+	who, held := keyHolds(r)
 	var out []map[string]any
 	for _, p := range provider.All() {
 		if !p.On() || p.DecideOnly() {
 			continue
 		}
 		for _, m := range Videomakers(p) {
+			if held && !modelAllowed(who, p, m.ID) {
+				continue
+			}
 			name := cmp.Or(m.Name, m.ID)
 			out = append(out, map[string]any{"id": p.ID + "/" + m.ID, "object": "model", "type": "model", "kind": "video", "created": 0,
 				"owned_by": p.ID, "display_name": name, "magpie_label": name + " · " + p.Name,
@@ -1053,10 +1063,10 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if r.Header.Get(provider.DrawersHeader) != "" {
-		data = append(data, drawerObjects()...)
+		data = append(data, drawerObjects(r)...)
 	}
 	if r.Header.Get(provider.VideomakersHeader) != "" {
-		data = append(data, videomakerObjects()...)
+		data = append(data, videomakerObjects(r)...)
 	}
 	if r.Header.Get(provider.DecidersHeader) != "" {
 		deciders := keyAllowed(r, provider.Deciders())
@@ -1929,7 +1939,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// the agent's pick of it is sent in its vendor's fast mode
 			// (#954), as a group's member may be; its fallbacks, other
 			// models, go as they are
-			fastPick(cands, pl, p.ID, model)
+			fastPick(cands, pl, p.ID, model, provider.IsUltraPick(agent, p.ID+"/"+model))
 		}
 	}
 	agentPick := provider.AgentEffort(agent)
@@ -2158,6 +2168,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// whole list still finds a Codex account to spend a reset on
 	all := cands
 	cands = probeOne(cands)
+	var cacheReport *Request
+	if wantsClientCache(r, from) && slices.ContainsFunc(cands, func(c candidate) bool { return c.p.Account != nil && c.p.Account.Agent == "claude" }) {
+		var err error
+		cacheReport, err = parseAnthropicRequest(body, true)
+		if err != nil {
+			call.Status, call.Error = 400, err.Error()
+			writeError(w, from, 400, err.Error())
+			turnedAway()
+			return
+		}
+		// Tool drops are known before a queue or slow run selection can
+		// send streaming headers. Message drops wait for that selection.
+		cacheReport.clientCache.fresh = true
+	}
 	shown := aff
 	if len(cands) == 1 && aff.Why != "strict" {
 		shown = nil // nobody else to stay away from; strict left one alone (#1797)
@@ -2280,6 +2304,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// for a reply that only reasoned to be asked again (#667).
 		hw.thinkingShown = !refusesAfterThinking(c.model) || last && modelFamily(c.model) != ""
 		hw.ctx, hw.alive, hw.streams = r.Context(), kept, streams
+		report := cacheReport
+		if c.p.Account == nil || c.p.Account.Agent != "claude" {
+			report = nil
+		}
+		cacheReportTry(hw, report)
 		if streams && !settings.Load().NoLoopGuard {
 			// a reply stuck in a loop is ended, not let run to its limit
 			// (#1359)
@@ -2418,6 +2447,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// forwardTranslated)
 			attemptBody = withFast(from, attemptBody)
 		}
+		// a pick sent Ultrafast (#1954) asks for it in OpenAI's words; in
+		// Claude's, which have none, the try carries it (withUltra)
+		ultra := fast && c.ultra && !ownFast
+		if ultra && (from == provider.Chat || from == provider.Responses) {
+			attemptBody = withFields(attemptBody, map[string]any{"service_tier": "ultrafast"})
+		}
 		// a member known not to think is sent no reasoning ask (#950): the
 		// group reasons for the members that do, and asking one that can't
 		// is what some vendors turn away with a 400. Every other field goes
@@ -2451,8 +2486,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		// Ultrafast goes first to an account whose plan offers it, and an
 		// account whose own list doesn't is asked for priority (Fast)
-		// instead, which every plan with Fast takes (yxinyu715 on X)
-		if from == provider.Responses && askedTier(attemptBody) == "ultrafast" && !takesTier(c, "ultrafast") {
+		// instead, which every plan with Fast takes (yxinyu715 on X): asked
+		// by the client in either of OpenAI's APIs, or by a pick (#1954)
+		openAI := from == provider.Chat || from == provider.Responses
+		if (openAI && askedTier(attemptBody) == "ultrafast" || ultra && from == provider.Anthropic) && !takesTier(c, "ultrafast") {
 			if j := tierMate(cands[i+1:], c, "ultrafast"); j >= 0 {
 				j += i + 1
 				cs := slices.Clone(cands)
@@ -2460,7 +2497,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				i--
 				continue
 			}
-			attemptBody = withFields(attemptBody, map[string]any{"service_tier": "priority"})
+			if openAI {
+				attemptBody = withFields(attemptBody, map[string]any{"service_tier": "priority"})
+			}
+			ultra = false
 		}
 		// an effort changed mid-thread goes as an update in the history,
 		// which keeps the prompt the upstream cached (#617)
@@ -2507,6 +2547,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			if ownFast {
 				ctx = withOwnFast(ctx)
+			}
+			if ultra && from == provider.Anthropic {
+				ctx = withUltra(ctx)
 			}
 			hw.stop = stop
 			if autoPicks(c) {
@@ -2804,7 +2847,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 					Requested: call.Model, Served: call.Usage.Served, Upstream: call.Usage.Upstream,
 					Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Effort: wentAt, Millis: try.Millis, Status: call.Status,
+					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: try.Millis, Status: call.Status,
 					TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
@@ -2848,7 +2891,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 					Requested: call.Model, Served: call.Usage.Served,
 					Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Effort: wentAt, Millis: try.Millis, Status: call.Status,
+					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: try.Millis, Status: call.Status,
 					TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
@@ -3313,7 +3356,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 			Requested: call.Model, Served: call.Usage.Served, Upstream: call.Usage.Upstream,
 			Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-			CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Effort: wentAt, Millis: call.Millis, Status: call.Status,
+			CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: call.Millis, Status: call.Status,
 			TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 			TTFT: call.TTFT, FirstText: call.FirstText, FirstReasoning: call.FirstReasoning, ReasoningHidden: call.ReasoningHidden, Flow: call.Flow, Sent: sentMs, Own: ownMs, Retried: retriedMs, Queued: queuedMs, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 			RequestID: call.Usage.RequestID, ResponseID: call.Usage.ResponseID, Endpoint: endpointOf(r, from, call.To, lastTried, model), Stop: call.Usage.Stop, Archive: call.archiveName()}
@@ -3580,6 +3623,9 @@ func markAntigravityRefused(w http.ResponseWriter, p provider.Provider, system, 
 // 403 or 400 it can mend (Provider.Retry) is asked again, a few times at most.
 func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.Protocol, path string, body []byte, in http.Header) (*http.Response, error) {
 	res, err := s.forwardOnce(ctx, p, to, path, body, in)
+	if err == nil && mantleRoutes(p, to) {
+		res, err = s.mantleReroute(ctx, p, to, path, body, in, res)
+	}
 	if err == nil && (res.StatusCode == http.StatusForbidden || res.StatusCode == http.StatusBadRequest) && p.Retries() {
 		// an account that can mend what the refusal names (a Factory org
 		// the server won't take; a model Copilot's Auto picked that the
@@ -3685,6 +3731,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	if p.IsOpenCode() && p.OpenCodeFree(gjson.GetBytes(body, "model").String()) {
 		// Zen's free tier answers at the inference API's URL alone (zenfree.go)
 		base = provider.OpenCodeFreeURL(base)
+	}
+	if mantleRoutes(p, to) {
+		// Bedrock Mantle serves each model under /v1 or /openai/v1
+		// (mantle.go)
+		m := gjson.GetBytes(body, "model").String()
+		base = provider.MantleBase(base, m, !s.fits(p.ID, mantleRouteKey(m), to))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
 	if err != nil {
@@ -4779,8 +4831,13 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		// the tier the client asked for goes to a provider the user added
 		// by its address as it was asked (Request.Tier), and to another
 		// magpie, which offered it and serves it as its own Codex would be
-		// (#1234)
-		if own := (p.Preset == "" && p.Account == nil || p.IsRemoteMagpie()) && s.fits(p.ID, tierField, to); own != req.OwnTier {
+		// (#1234), and to a provider plugin, on its Chat or Responses, when
+		// it is one the plugin says the model is served at (#2514)
+		own := p.Preset == "" && p.Account == nil || p.IsRemoteMagpie()
+		if p.IsPlugin() {
+			own = req.Tier != "" && (to == provider.Chat || to == provider.Responses) && slices.Contains(provider.PluginTiers(p, model), req.Tier)
+		}
+		if own := own && s.fits(p.ID, tierField, to); own != req.OwnTier {
 			r := *req
 			r.OwnTier, req = own, &r
 		}
@@ -4791,6 +4848,13 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		if req.OwnTier && req.Tier == "" && isOwnFast(ctx) && (to == provider.Chat || to == provider.Responses) {
 			r := *req
 			r.Tier, req = "priority", &r
+		}
+		// a pick sent Ultrafast from an agent on Claude's API, whose words
+		// for it are speed "fast" (#1954): on the ChatGPT backend alone
+		// (buildResponses)
+		if req.Fast && !req.Ultrafast && isUltra(ctx) && to == provider.Responses {
+			r := *req
+			r.Ultrafast, req = true, &r
 		}
 		// Anthropic's API needs a reply limit: one the client didn't name
 		// is the model's own, not a flat 16384 (#1792, askedOutput)

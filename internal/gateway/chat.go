@@ -77,7 +77,7 @@ func parseChat(body []byte) (*Request, error) {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: c.Model, MaxTokens: c.MaxCompletionTokens, Temp: c.Temperature, TopP: c.TopP,
-		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority", Tier: c.ServiceTier,
+		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority" || c.ServiceTier == "ultrafast", Ultrafast: c.ServiceTier == "ultrafast", Tier: c.ServiceTier,
 		CacheKey: c.PromptCacheKey, Format: openAIFormat(c.ResponseFormat), AccessPrograms: c.AccessPrograms}
 	if r.MaxTokens == 0 {
 		r.MaxTokens = c.MaxTokens
@@ -234,11 +234,22 @@ func dataURL(p Part) string {
 // built-in's, for show, which Cursor's is none, and its fast mode was lost
 // on every request magpie translated (#1360).
 func buildHost(p provider.Provider) string {
-	if p.IsPlugin() && p.PluginProvider() == "cursor" {
-		return "cursor"
+	if p.IsPlugin() {
+		switch id := p.PluginProvider(); id {
+		case "cursor", provider.CommandCodePlanID, "devin", "qoder", "qoder-cn":
+			// the plugin's own id, never the built-in's API host a moved
+			// account shows (api.commandcode.ai), which lost a moved Command
+			// Code Go conversation its reasoning
+			return id
+		}
 	}
 	return p.Host()
 }
+
+// failedAsText are the plugins whose vendor has no failed mark on a tool
+// result: the built-in said it in the text, "Error: " first (devin.go,
+// qoder.go), and so the chat request to the plugin says it there too.
+var failedAsText = map[string]bool{"devin": true, "qoder": true, "qoder-cn": true}
 
 // chatReplaysReasoning is whether a Chat upstream wants a turn's reasoning
 // back in reasoning_content: DeepSeek's models wherever they are served
@@ -418,7 +429,16 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 					}
 					out += note
 				}
-				tools = append(tools, map[string]any{"role": "tool", "tool_call_id": p.CallID, "content": out})
+				if p.IsError && failedAsText[host] {
+					out = "Error: " + out
+				}
+				tool := map[string]any{"role": "tool", "tool_call_id": p.CallID, "content": out}
+				if p.IsError && host == "cursor" {
+					// Cursor's plugin reads it, as the built-in told Cursor
+					// isError; another chat upstream has no such field
+					tool["is_error"] = true
+				}
+				tools = append(tools, tool)
 				seeLater(p)
 			}
 		}
@@ -776,6 +796,8 @@ type cUsage struct {
 	CachedTokens             int `json:"cached_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	// Credit is what WorkBuddy says the request cost in its plan's credits
+	Credit *float64 `json:"credit"`
 	// what a plugin's step collected of its conversation's earlier steps,
 	// which their own replies couldn't count (the Cursor plugin's usage
 	// events that showed late, yetone/magpie#1053): billed with the step,
@@ -811,6 +833,9 @@ func (u cUsage) usage() Usage {
 	}
 	if u.CompletionTokensDetails != nil {
 		out.Reasoning = u.CompletionTokensDetails.ReasoningTokens
+	}
+	if c := u.Credit; c != nil && *c >= 0 {
+		out.Credits = c
 	}
 	if d := u.MagpieDeferred; d != nil && d.PromptTokens+d.CompletionTokens > 0 {
 		out.Deferred = &Usage{Input: max(d.PromptTokens-d.CachedTokens-d.CacheWriteTokens, 0), Output: d.CompletionTokens,
@@ -1063,7 +1088,7 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 			emit(Event{Kind: KStop, Stop: stopFromChat(c.FinishReason)})
 		}
 	}
-	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0 || ch.Usage.MagpieDeferred != nil) {
+	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0 || ch.Usage.MagpieDeferred != nil || ch.Usage.Credit != nil) {
 		emit(Event{Kind: KUsage, Usage: ch.Usage.usage()})
 	}
 	return nil

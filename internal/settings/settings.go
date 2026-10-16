@@ -117,6 +117,14 @@ type Settings struct {
 	// its place (gateway.AllowIPs). This computer's own (KeepOwn), as LAN
 	// is: the addresses are of the network this computer is on.
 	AllowIPs []string `json:"allowIPs,omitempty"`
+	// FetchPrivate are the private hosts and ranges (a name, name:port, an
+	// IP or a CIDR range) magpie may download a URL from that it didn't
+	// choose itself: an image or video a request names or a vendor answers
+	// with, or a page web_fetch reads. None by default: such a URL is
+	// downloaded from public addresses only, whoever sent the request and
+	// from wherever (gateway.publicClient). In settings.json only; it names
+	// this computer's own network, so it isn't synced (KeepOwn).
+	FetchPrivate []string `json:"fetchPrivate,omitempty"`
 	// Port is the gateway's port on this computer, 0 for DefaultPort.
 	// MAGPIE_ADDR, where it is set, comes first (GatewayAddr).
 	Port int `json:"port,omitempty"`
@@ -559,6 +567,10 @@ type Settings struct {
 	// switched by the model in the agent's picker, as a routing group's
 	// member is (Group.Fast), without making a group of it.
 	FastPicks map[string][]string `json:"fastPicks,omitempty"`
+	// UltraPicks are the fast picks an agent's requests for are sent as
+	// Ultrafast instead (#1954), by agent id: each is in FastPicks too. An
+	// account that doesn't offer Ultrafast on the model is sent priority.
+	UltraPicks map[string][]string `json:"ultraPicks,omitempty"`
 
 	// The three maps below, and every one added beside them, are the
 	// per-model ones: a field named Model* whose type is a map[string]X,
@@ -939,6 +951,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.QuotaReads = cur.QuotaReads
 	s.NoAccountDiscovery = cur.NoAccountDiscovery
 	s.LAN, s.AllowIPs = cur.LAN, cur.AllowIPs
+	s.FetchPrivate = cur.FetchPrivate
 	s.SessionTerminal = cur.SessionTerminal
 }
 
@@ -1035,6 +1048,14 @@ func loadChecked() (Settings, error) {
 	}
 	// parsed on every call: a caller that asks many times in one look holds
 	// what it read (provider.Hold's heldSettings) rather than asking again
+	return parse(b)
+}
+
+// parse is settings.json's contents b read as Settings, from its last good
+// generation when b doesn't parse.
+func parse(b []byte) (Settings, error) {
+	var s Settings
+	var err error
 	parses.Add(1)
 	if perr := json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &s); perr != nil {
 		// one left all zero by a crash (#1505) is its last good generation

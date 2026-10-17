@@ -938,7 +938,7 @@ func nativeEndpoints(e provider.Entry) []string {
 // asks for them in its list (provider.DrawersHeader): "kind": "image",
 // which an agent's list never has, so it takes none for a model to chat
 // with. A gateway key held to some models is told of those alone, as its
-// chat list is.
+// chat list is: models it names that an account it may use serves (#2579).
 func drawerObjects(r *http.Request) []map[string]any {
 	who, held := keyHolds(r)
 	var out []map[string]any
@@ -947,7 +947,7 @@ func drawerObjects(r *http.Request) []map[string]any {
 			continue
 		}
 		for _, m := range Drawers(p) {
-			if held && !modelAllowed(who, p, m.ID) {
+			if held && (!modelAllowed(who, p, m.ID) || !accountServes(who, p, m.ID)) {
 				continue
 			}
 			name := cmp.Or(m.Name, m.ID)
@@ -965,7 +965,8 @@ func drawerObjects(r *http.Request) []map[string]any {
 
 // videomakerObjects are the video models magpie makes videos with, as
 // another magpie asks for them (provider.VideomakersHeader): "kind": "video".
-// A gateway key held to some models is told of those alone.
+// A gateway key held to some models or accounts is told of those alone,
+// as its chat list is (#2579).
 func videomakerObjects(r *http.Request) []map[string]any {
 	who, held := keyHolds(r)
 	var out []map[string]any
@@ -974,7 +975,7 @@ func videomakerObjects(r *http.Request) []map[string]any {
 			continue
 		}
 		for _, m := range Videomakers(p) {
-			if held && !modelAllowed(who, p, m.ID) {
+			if held && (!modelAllowed(who, p, m.ID) || !accountServes(who, p, m.ID)) {
 				continue
 			}
 			name := cmp.Or(m.Name, m.ID)
@@ -1374,6 +1375,9 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 			// own: in the request's tools for every route, the relay's
 			// and every check that reads them (#2322)
 			body = liftMessageTools(body)
+			// a tool in MCP's, Anthropic's or Responses' shape, which
+			// no Chat API takes, in the Chat shape for every route (#2622)
+			body = shapeChatTools(body)
 		}
 		// Claude Code's headers, for a test asked as Claude Code to ask
 		// with (provider.TestAs), whatever serves this model: a
@@ -1906,7 +1910,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		if currentImage {
 			call.Status, call.Error = 400, "model does not support image input"
-			writeError(w, from, 400, fmt.Sprintf("model %q does not support image input%s", call.Model, noSeerNote()))
+			group := ""
+			if isGroup {
+				group = g.Name
+			}
+			writeError(w, from, 400, fmt.Sprintf("model %q does not support image input%s%s", call.Model, textOnlyNote(p, model, group), noSeerNote()))
 			turnedAway()
 			return
 		}
@@ -2154,7 +2162,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			if len(cands) == 0 {
 				call.Status, call.Error = 400, "model does not support image input"
-				writeError(w, from, 400, fmt.Sprintf("model %q does not support image input%s", call.Model, noSeerNote()))
+				writeError(w, from, 400, fmt.Sprintf("model %q does not support image input%s%s", call.Model, textOnlyNote(p, model, g.Name), noSeerNote()))
 				turnedAway()
 				return
 			}
@@ -2416,14 +2424,27 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			levels = groupLevels(g, ms, c)
 		}
 		fixed := cmp.Or(c.effort, withinLevels(askedEffort, levels))
-		if fixed == "" && effort == "" && agentPick != "" && c.p.Thinks(c.model) {
+		// the reasoning the rule that put this member first asks it for
+		// (#2633), over the agent's, a suffix's and the turn's pick; a
+		// member fixed at an effort keeps its own
+		ruled := ""
+		if c.effort == "" {
+			if ruled = ruleEffort(c, hit, nested); ruled != "" {
+				fixed = ""
+			}
+		}
+		if fixed == "" && ruled == "" && effort == "" && agentPick != "" && c.p.Thinks(c.model) {
 			// the effort picked in magpie for an agent whose config can't
 			// carry one (Cursor Private Inference, #1003), in place of the
 			// level it sent, on a model that reasons; a member fixed at
 			// one, a suffix and the turn's pick are more particular
 			fixed = withinLevels(agentPick, levels)
 		}
-		if fixed != "" {
+		if ruled != "" {
+			// asked even of a request that asked for no reasoning, as a
+			// member fixed at an effort is; already fitted to its levels
+			attemptBody = withFixedEffort(from, attemptBody, ruled)
+		} else if fixed != "" {
 			// a member fixed at an effort is asked for it, at the level its
 			// model has nearest, whatever the agent asked or the turn's
 			// pick: even a request that asked for no reasoning
@@ -2523,7 +2544,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		s.trace.update(tr, func(t *Route) {
 			t.imageProvider = c.p.ID
-			t.Tries = append(t.Tries, Try{ID: c.rest, Model: c.model, Effort: sent, Picked: picked, Fixed: fixed, Fast: fast, Start: began})
+			t.Tries = append(t.Tries, Try{ID: c.rest, Model: c.model, Effort: sent, Picked: picked, Fixed: fixed, RuleEffort: ruled, Fast: fast, Start: began})
 		})
 		held := false          // answered as its vendor did a moment ago, without asking
 		var heldBack time.Time // when the first of those held out of their allowance is back
@@ -2697,7 +2718,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		wentTier = at.tier
 		ended = time.Now()
-		try := Try{ID: c.rest, Model: c.model, Effort: wentAt, Picked: picked, Fixed: fixed, Fast: fast, Start: began, Done: true, Status: call.Status, Millis: ended.Sub(began).Milliseconds(), Error: call.Error, Queued: queued,
+		try := Try{ID: c.rest, Model: c.model, Effort: wentAt, Picked: picked, Fixed: fixed, RuleEffort: ruled, Fast: fast, Start: began, Done: true, Status: call.Status, Millis: ended.Sub(began).Milliseconds(), Error: call.Error, Queued: queued,
 			Served: call.Usage.Served, Upstream: call.Usage.Upstream, Tier: wentTier, TierServed: call.Usage.Tier, Auto: autoPicked(),
 			Net: nt.timing(began, queued)}
 		if resetFirst != nil {
@@ -3407,6 +3428,12 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 		body = orphanedToolOutputs(body)
 		body = pairToolItems(body)
 	}
+	if from == provider.Chat {
+		// a call kept with an empty id, which a strict upstream turns
+		// the whole request away for (#2611); before the relay, the
+		// translation and a plugin's fetch alike
+		body = chatCallIDs(body)
+	}
 	// every request to the provider goes through its own proxy, if it has
 	// one (#237)
 	r = r.WithContext(p.Via(r.Context()))
@@ -4017,6 +4044,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 	case provider.Chat:
 		body = developerAsSystem(body)
+		// a turn the client cut off before it said anything, which
+		// DeepSeek and Kimi turn every later request away for (#2599)
+		body = silentAssistantsOut(body)
 		if mistral := p.Preset == "mistral" || p.Host() == "api.mistral.ai"; !mistral && (chatReplaysReasoning(buildHost(p), model) || chatReplaysReasoning(buildHost(p), upstream)) {
 			// a tool call the client kept no thinking for, which DeepSeek
 			// turns the whole request away for (#1462)
@@ -5525,7 +5555,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		}
 		return writeVendorError(w, from, res.StatusCode, msg, b), msg
 	}
-	dec := decoder(actual)
+	dec := decoderFor(p, actual)
 	rd, sse := eventStream(res)
 	if !sse {
 		// the provider ignored stream:true; read the whole reply as one
@@ -5768,6 +5798,18 @@ func build(proto provider.Protocol, r *Request, model, host string, rejectTemp b
 		out = withFields(out, map[string]any{"speed": "fast"})
 	}
 	return out, nil
+}
+
+// decoderFor is decoder for p's replies. A plugin's Chat text is read as
+// OpenCode reads it, as it came: the plugin knows its vendor and gives its
+// reasoning apart, so a <think> at the head of its text is the model's
+// words, not a block of thinking to take out (Qoder's, #2634).
+func decoderFor(p provider.Provider, proto provider.Protocol) func(data string, emit func(Event)) error {
+	if proto == provider.Chat && p.IsPlugin() {
+		d := &chatDecoder{past: true}
+		return d.decode
+	}
+	return decoder(proto)
 }
 
 func decoder(proto provider.Protocol) func(data string, emit func(Event)) error {

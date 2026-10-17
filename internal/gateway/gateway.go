@@ -638,6 +638,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/magpie/limit", s.keyLimit)
 	// a heap profile of this process, for magpie heap (loopback only)
 	mux.HandleFunc("GET "+HeapPath, s.heapProfile)
+	// a CPU profile of this process over some seconds, for magpie cpu
+	// (loopback only)
+	mux.HandleFunc("GET "+CPUPath, s.cpuProfile)
 	mux.HandleFunc("GET /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("OPTIONS /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("POST /v1/chat/completions", s.handle(provider.Chat))
@@ -1252,7 +1255,6 @@ func (s *Server) countOn(w http.ResponseWriter, r *http.Request, p provider.Prov
 		// ZCode itself never counts, and zcode.z.ai answers count_tokens
 		// with an error every time: one more request its firewall weighs
 		p.Account.Agent == "zcode") ||
-		ok && p.Account != nil && p.Account.Agent == provider.CommandCodePlanID && cmdGoing(r.Context(), p) ||
 		ok && p.IsPlugin() && (slices.Contains(estimatedMoved, p.ID) || slices.Contains(estimatedMoved, p.PluginProvider())) {
 		req, err := parseAnthropic(body)
 		if err != nil {
@@ -2401,6 +2403,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				attemptBody, _ = textOnlyBody(from, body) // omit images in prior turns and tool results
 			}
 		}
+		// a middleware's onProvider changes what this provider is sent
+		attemptBody = triedOn(r.Context(), c.p, c.model, attemptBody)
 		if !last && s.antigravityForeseen(c.p, from, attemptBody) {
 			// Antigravity would only turn it away, as it did lately, and
 			// someone after it may answer: it isn't asked, and nothing is
@@ -3463,51 +3467,6 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 		call.To = provider.Anthropic
 		return s.serveClaudeSubscription(w, r, from, p, model, body, &call.Usage)
 	}
-	// the subscriptions below are asked through their own clients' APIs,
-	// never Anthropic's: Claude Code's billing line, which changes every
-	// turn, would be the first words of their prompt and its cache missed
-	// from there on (#1600, billing_line.go)
-	own := body
-	if from == provider.Anthropic {
-		own = withoutBillingLine(body)
-	}
-	// Cursor's through the API its CLI talks to, with the CLI's sign-in
-	if p.Account != nil && p.Account.Agent == "cursor" {
-		call.To = from
-		return s.serveCursor(w, r, from, model, own, &call.Usage)
-	}
-	// Devin's through the API its CLI talks to, with the CLI's sign-in or
-	// one magpie keeps beside it
-	if p.Account != nil && p.Account.Agent == "devin" {
-		call.To = from
-		return s.serveDevin(w, r, from, p.Account.Home, model, own, &call.Usage)
-	}
-	// Kiro's is served through its own API, with kiro-cli's or the Kiro
-	// IDE's sign-in, or a Kiro API key saved on the provider
-	if p.Account != nil && p.Account.Agent == "kiro" {
-		call.To = from
-		return s.serveKiro(w, r, from, p, model, own, &call.Usage)
-	}
-	// Qoder is served through the API the client talks to, signed with the
-	// COSY envelope, with the account magpie signed in to.
-	if p.Account != nil && (p.Account.Agent == "qoder" || p.Account.Agent == provider.QoderCNID) {
-		call.To = from
-		return s.serveQoder(w, r, from, p, model, own, &call.Usage)
-	}
-	// Zed's through cloud.zed.dev, written in the API of the model's own
-	// provider, with the account magpie signed in to
-	if p.Account != nil && p.Account.Agent == "zed" {
-		call.To = from
-		return s.serveZed(w, r, from, p, model, own, &call.Usage)
-	}
-	// Command Code's Go plan has no Provider API: it is asked where the
-	// CLI asks, in the CLI's own format; its other plans go on as keys do
-	if p.Account != nil && p.Account.Agent == provider.CommandCodePlanID {
-		if api, key, ok := cmdGenerate(r.Context(), p); ok {
-			call.To = from
-			return s.serveCommandCode(w, r, from, p, api, key, model, own, &call.Usage)
-		}
-	}
 	// Copilot's Auto (all a Student plan may pick) is asked which model it
 	// picks, as Copilot's clients do, and the request goes to that model on
 	// the APIs it is served on, with the session's token
@@ -4428,9 +4387,23 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		res.Body.Close()
 		res.Body = io.NopCloser(bytes.NewReader(b))
-		if toolsWithoutEffort.Match(b) && !s.servesElsewhere(p, model, proto) {
-			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(withBodyEffort(proto, body, "none")), r.Header); err != nil {
+		if toolsWithoutEffort.Match(b) && !s.servesElsewhere(p, model, proto) && !s.turnedAway(p, model, "none", proto) {
+			off, err := s.forward(r.Context(), p, proto, path, p.Prepare(withBodyEffort(proto, body, "none")), r.Header)
+			if err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+			}
+			ob, _ := io.ReadAll(io.LimitReader(off.Body, 1<<20))
+			off.Body.Close()
+			off.Body = io.NopCloser(bytes.NewReader(ob))
+			if off.StatusCode == http.StatusBadRequest && effortLevelsNamed.Match(ob) {
+				// none refused too, naming the levels the model takes
+				// (#2670): remembered, and not asked again, and the tools
+				// refusal is the answer, which wrongEndpoint reads: no
+				// other API left, a group's next member is asked, and the
+				// agent is told the Responses URL to set
+				s.markUnfit(p.ID, offRefused(model), proto)
+			} else {
+				res = off
 			}
 		}
 	}
@@ -4851,6 +4824,12 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 	imageTried := false
 	// Gemini's thinking levels turned away this time (geminiRefusedLevel)
 	var levelsRefused []string
+	// the request before #176 asked it without reasoning, and the tools
+	// refusal that made it ask (toolsWithoutEffort): none turned away too,
+	// that refusal is the answer (#2670)
+	var beforeOff *Request
+	var toolsRefusal []byte
+	offAsked := false
 	for {
 		if mayDropImageTool(p) && !s.fits(p.ID, imageToolRefused, to) {
 			req, _ = withoutImageToolReq(req)
@@ -5105,9 +5084,23 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			// refuses minimal for: asked again at its lowest, and so from
 			// then on
 			s.markUnfit(p.ID, offRefused(model), to)
-			r := *req
-			r.Effort, req = onEffort(p, model), &r
-			continue
+			if beforeOff != nil {
+				// the none was #176's, for tools the upstream takes with no
+				// reasoning on chat (#2670: a relay that names none and
+				// refuses it): any other level is refused as the first
+				// was, so the request isn't asked again at its lowest. The
+				// tools refusal is the answer, which wrongEndpoint reads:
+				// the provider has no other API to try, a group's next
+				// member is asked (shapeRefused), and the agent is told the
+				// Responses URL to set
+				req, b = beforeOff, toolsRefusal
+				beforeOff = nil
+				res.Body = io.NopCloser(bytes.NewReader(b))
+			} else {
+				r := *req
+				r.Effort, req = onEffort(p, model), &r
+				continue
+			}
 		}
 		if p.IsVertex() && res.StatusCode == http.StatusBadRequest && vertexSignatureRefused.Match(b) {
 			// a call's signature Vertex AI won't take (a client changed
@@ -5126,9 +5119,13 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			continue
 		}
 		if to == provider.Chat && res.StatusCode == http.StatusBadRequest && req.Effort != "none" &&
-			toolsWithoutEffort.Match(b) && !s.servesElsewhere(p, model, to) && s.fits(p.ID, offRefused(model), to) {
+			toolsWithoutEffort.Match(b) && !s.servesElsewhere(p, model, to) && !offAsked && !s.turnedAway(p, model, "none", to) {
 			// tools with reasoning refused on chat, and no Responses API
-			// to take them to: asked again without reasoning (#176)
+			// to take them to: asked again without reasoning (#176). Once
+			// none is known refused it isn't asked again (the loop would
+			// take it up to the lowest level, refused the same): the
+			// refusal goes on as one of the endpoint (#2670)
+			beforeOff, toolsRefusal, offAsked = req, b, true
 			r := *req
 			r.Effort, req = "none", &r
 			continue
@@ -5180,7 +5177,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		if len(next) == 0 {
 			return res, to, nil
 		}
-		to = next[0]
+		to, beforeOff = next[0], nil
 	}
 }
 

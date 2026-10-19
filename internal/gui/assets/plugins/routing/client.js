@@ -465,6 +465,11 @@ function routingPage(part) {
   const LONE = "Only one account or key is on for this, so routing has nothing to choose between. Turn on a second in the provider's editor, and how it routes is set under Several accounts or keys below.";
 
   const agentOf = (id) => (state.clients || state.agents).find((a) => a.id === id);
+  // uaName is a client as the gateway names one it doesn't know
+  // (usage.AgentOf): its User-Agent's product name, before the first / or
+  // space, in lower case as a rule keeps it. "SillyTavern/1.12" is
+  // sillytavern; a comma would part it in two (ParseRule)
+  const uaName = (s) => String(s || "").trim().split(/[\/\s,]/)[0].toLowerCase();
   const agentName = (id) => agentOf(id)?.name || (id && id !== "other" ? id : t("your agent"));
   // who names an account or key in a sentence
   const who = (w) => w.kind === "provider" ? w.name : w.who;
@@ -1057,7 +1062,7 @@ function routingPage(part) {
   // ---------- state ----------
 
   const routes = new Map(); // id → the latest of each route
-  let seq = 0, mine = true, loaded = false, daysAt = 0;
+  let seq = 0, mine = true, loaded = false, daysAt = 0, by = null;
   let traceTotals = { requests: 0, rerouted: 0, errors: 0 };
   let offMsg = ""; // why the trace can't be watched here, when it can't
   // the request the window was opened on (?req=), from the tray panel
@@ -1350,7 +1355,7 @@ function routingPage(part) {
     s.pk = "group/" + info.id;
     s.li.style.setProperty("--depth", d);
     s.name.textContent = info.name || info.id;
-    s.id.textContent = "group/" + info.id;
+    s.id.textContent = info.ref || "group/" + info.id;
     s.mode.textContent = t(modeOf(info.routing || "")[0]);
     s.rules = info.rules ? t(info.rules === 1 ? "1 rule" : "{n} rules", { n: info.rules }) : "";
     return s;
@@ -3385,6 +3390,11 @@ function routingPage(part) {
         noteAccounts(d);
         skew = at(d.now) - Date.now();
         mine = d.mine;
+        // another magpie took the gateway over (#2606): its routes and seq
+        // are its own, so the page starts again from its whole trace
+        const fromOther = loaded && (d.by?.pid || 0) !== (by?.pid || 0);
+        by = d.by || null;
+        if (fromOther) { routes.clear(); seq = 0; loaded = false; hubText(); continue; }
         hubText();
         traceTotals = d.totals || traceTotals;
         if (!mine) {
@@ -3460,7 +3470,17 @@ function routingPage(part) {
     }
   }
 
-  function hubText() { setText(hubSub, (providers?.gateway?.url || "").replace(/^https?:\/\//, "") || t("gateway")); }
+  function hubText() {
+    const g = providers?.gateway;
+    // which magpie is routing, when it isn't this one (#2606): this page plays
+    // that magpie's routing, and its window is the other place it shows. It
+    // is named by the trace the page plays, so it goes with a takeover at once
+    const who = mine && by?.serves
+      ? t("{serves} (pid {pid}) is routing", { serves: by.serves, pid: by.pid }) + " · "
+      : "";
+    setText(hubSub, who + ((g?.url || "").replace(/^https?:\/\//, "") || t("gateway")));
+    hubSub.title = who ? hubSub.textContent : ""; // whole, where the node cuts it short
+  }
 
   // labels in the page's language, and again when it changes
   function words() {
@@ -3778,7 +3798,7 @@ function routingPage(part) {
     try { return hayMatches(g, words); } catch { return true; } // a group that can't be read is shown, flagged
   }
   function hayMatches(g, words) {
-    const hay = [g.name, g.id, "group/" + g.id, ...g.members.flatMap((id) => [id, memberLabel(g, id)]), ...(g.patterns || []).map((p) => p.pattern)].join("\n").toLowerCase();
+    const hay = [g.name, g.id, "group/" + g.id, g.ref || "", ...g.members.flatMap((id) => [id, memberLabel(g, id)]), ...(g.patterns || []).map((p) => p.pattern)].join("\n").toLowerCase();
     return words.every((w) => hay.includes(w));
   }
   // rowOrFlag: a group's row, or when drawing it fails, a row that says so
@@ -3789,7 +3809,7 @@ function routingPage(part) {
       const row = el("div", "rt-group off rt-gbad");
       row.dataset.id = g.id;
       const main = el("div", "main"), nm = el("div", "nm");
-      nm.append(el("b", "", String(g.name || g.id)), el("code", "mdl", "group/" + g.id));
+      nm.append(el("b", "", String(g.name || g.id)), el("code", "mdl", g.ref || "group/" + g.id));
       main.append(nm, el("div", "mem", t("This group can't be shown: {error}", { error: e?.message || String(e) })));
       row.append(el("span", "ics"), main);
       return row;
@@ -4090,7 +4110,7 @@ function routingPage(part) {
     const ics = el("span", "ics");
     ics.append(stackIcon(groupIcons(g)));
     const main = el("div", "main"), nm = el("div", "nm");
-    nm.append(el("b", "", g.name), el("code", "mdl", "group/" + g.id));
+    nm.append(el("b", "", g.name), el("code", "mdl", g.ref || "group/" + g.id));
     if (g.auto) nm.append(el("small", "auto", t("found by magpie")));
     main.append(nm, el("div", "mem", g.members.map((id) => memberLabel(g, id)).join(g.routing === "order" ? " → " : " · ")));
     row.append(cb, ics, main);
@@ -4112,7 +4132,7 @@ function routingPage(part) {
     s.onclick = (e) => { e.stopPropagation(); setFound(!on, s); };
     const txt = el("div", "txt");
     txt.append(el("b", "", t("Find groups on their own")), el("small", "", on
-      ? t("A model two or more of your providers serve becomes a group of them (auto-…). Switch it off to list and serve only the groups you made or changed.")
+      ? t("A model two or more of your providers serve becomes a group of them (auto/…). Switch it off to list and serve only the groups you made or changed.")
       : t("Off: only the groups you made or changed are listed and served. An agent set to a found group is moved to its model from one provider, and a request still naming one goes there too.")));
     gFound.replaceChildren(txt, s);
   }
@@ -4146,7 +4166,7 @@ function routingPage(part) {
     const ics = groupHandle(g, row);
     const main = el("div", "main");
     const nm = el("div", "nm");
-    nm.append(el("b", "", g.name), el("code", "mdl", "group/" + g.id));
+    nm.append(el("b", "", g.name), el("code", "mdl", g.ref || "group/" + g.id));
     if (g.auto) nm.append(el("small", "auto", t("found by magpie")));
     const manual = g.routing === "manual";
     const sep = g.routing === "order" ? " → " : " · ";
@@ -4391,8 +4411,8 @@ function routingPage(part) {
       return id;
     };
     const showId = () => {
-      idHint.textContent = t("Agents pick it as {id}", { id: "group/" + idOf() }) +
-        (g && idOf() !== g.id ? " · " + t("an agent set to {id} needs setting again", { id: "group/" + g.id }) : "");
+      idHint.textContent = t("Agents pick it as {id}", { id: g?.ref && idOf() === g.id ? g.ref : "group/" + idOf() }) +
+        (g && idOf() !== g.id ? " · " + t("an agent set to {id} needs setting again", { id: g.ref || "group/" + g.id }) : "");
     };
     // what the agents' lists will call it (#868: an agent's narrow menu
     // cut it to "· rou…"); whether "· routing group" follows the name is
@@ -4425,6 +4445,13 @@ function routingPage(part) {
     // More are picked with the model picker the agents use.
     const infoOf = (id) => g?.memberInfo?.find((x) => x.id === id);
     const pickFrom = (label, anchor, ev, options, onPick, value = "") => openPicker({ id: "", name: "", fields: [] }, { key: "rule", label, value, menu: true, options, onPick }, anchor, ev);
+    // the agents magpie heard from in the last 30 days that it doesn't
+    // know, by the names the gateway gave them (usage.AgentOf), asked for
+    // once while the editor is open; none when usage can't be read
+    let heardFrom = null;
+    const heard = () => heardFrom || (heardFrom = api("usage?period=30d")
+      .then((u) => (u?.agents || []).map((a) => uaName(a.id)).filter((id) => id && id !== "other" && id !== "magpie"))
+      .catch(() => []));
     const box = el("div", "fallback");
     const list = el("div", "fbl");
     const addBtn = el("button", "rt-gadd");
@@ -5017,18 +5044,31 @@ function routingPage(part) {
           wrap("compact", cp);
           if (mine === "compact") focus = () => cp.focus({ preventScroll: true });
         }
-        // agents
+        // agents: the ones magpie knows, the others it has heard from, and
+        // any typed by the name the gateway gives a client it doesn't know
+        // (raikyou on Discord: SillyTavern, one's own app)
         if (kinds.includes("agents")) {
           const clients = state.clients || state.agents || [];
           const agentsName = () => r.agents.length ? r.agents.map((id) => clients.find((a) => a.id === id)?.name || id).join(", ") : t("any agent");
           const ag = el("button", "rt-cond" + (r.agents.length ? " on" : ""), agentsName());
-          ag.onclick = (ev) => pickFrom("agent", ag, ev, [
-            { value: "", label: t("any agent"), note: t("not a condition") },
-            ...clients.map((a) => ({ value: a.id, label: a.name, icon: a.icon, note: r.agents.includes(a.id) ? "✓" : "" })),
-          ], (v) => {
-            r.agents = !v ? [] : r.agents.includes(v) ? r.agents.filter((x) => x !== v) : [...r.agents, v];
-            ag.textContent = agentsName(); ag.classList.toggle("on", r.agents.length > 0); warn();
-          });
+          heard();
+          ag.onclick = async (ev) => {
+            ev.stopPropagation();
+            const known = new Set(clients.map((a) => a.id));
+            const others = [...(await heard()), ...r.agents].filter((id, i, all) => !known.has(id) && all.indexOf(id) === i);
+            const tick = (id) => r.agents.includes(id) ? "✓" : "";
+            openPicker({ id: "", name: "", fields: [] }, { key: "rule", label: "agent", value: "", menu: true,
+              placeholder: t("Filter, or type an agent's name…"),
+              typed: (s) => { const id = uaName(s); return id && { value: id, label: id, note: t("the name its User-Agent begins with") }; },
+              options: [
+                { value: "", label: t("any agent"), note: t("not a condition") },
+                ...clients.map((a) => ({ value: a.id, label: a.name, icon: a.icon, note: tick(a.id) })),
+                ...others.map((id) => ({ value: id, label: id, icon: "generic", note: tick(id) || t("heard from in the last 30 days") })),
+              ], onPick: (v) => {
+                r.agents = !v ? [] : r.agents.includes(v) ? r.agents.filter((x) => x !== v) : [...r.agents, v];
+                ag.textContent = agentsName(); ag.classList.toggle("on", r.agents.length > 0); warn();
+              } }, ag, ev);
+          };
           wrap("agents", ag);
           if (mine === "agents") focus = () => { ag.focus({ preventScroll: true }); ag.onclick({ stopPropagation() {} }); };
         }

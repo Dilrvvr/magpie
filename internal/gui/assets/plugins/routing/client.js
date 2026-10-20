@@ -450,6 +450,7 @@ function routingPage(part) {
     // editor's routing options say them (app.js ROUTINGS), so every
     // language is already spoken
     weight: ["By weight", "Requests spread over the keys by the weight set beside each: a key weighing 3 takes three requests for every one a key weighing 1 takes, evenly over a few requests. One that fails is passed over while it rests, and the others share its requests; a conversation stays with its key as Stays says."],
+    free: ["Free first", "Requests go to what costs nothing first: the models their vendor serves at no cost to this subscription's allowance or credits, in their listed order, and only when those can't answer to one that spends them. Nothing that cost nothing is left unused."],
   };
   // modeOf: a routing's name and what it does, a JS gateway plugin's
   // ("<plugin>/<name>", app.js jsRoutings) as it is named, served or not
@@ -585,6 +586,10 @@ function routingPage(part) {
         : t("In order: {who} is first, and answers everything while it can.", { who: w });
       case "rotate": return t("In turn: it's {who}'s turn — each request starts one further along.", { who: w });
       case "weight": return t("By weight: it's {who}'s share — each key takes requests as its weight says.", { who: w });
+      case "free":
+        if (f.free) return restedTo(t("it costs nothing there, so it's spent first."))
+          || t("Free first: {model} costs nothing on {who}, so it's tried before any that spends the allowance.", { model: f.model, who: w });
+        return t("Free first: every one that costs nothing is spent or resting, so {model} on {who}, which spends the allowance, is next.", { model: f.model, who: w });
       case "usage":
         if (f.known) return t("Least used first: {who} has the most of its allowance left — {n} used.", { who: w, n: pct(f.used) });
         if (f.kind === "key" && !someKnown) return t("Least used first: {who} served the fewest tokens lately — {n}.", { who: w, n: tokens(f.tokens || 0) });
@@ -1121,16 +1126,51 @@ function routingPage(part) {
     trips.push(tr);
   }).finally(() => { for (const l of legs) if (l.j) l.p.remove(); });
 
+  // measured is a path's length, and the tips of it flights met, for the d
+  // it had: measured again only when its d changes. Every frame poses
+  // every flight, and measured each leg and each wire end anew — with
+  // three agents sending at once, ~10 s of a 40 s look at the page went to
+  // getTotalLength and getPointAtLength alone, and the page lagged
+  // (yg6888 on X: "打开页面很卡").
+  const measured = new WeakMap(); // path → { d, L, tips, pts }
+  function measure(p) {
+    const d = p.isConnected && p.getAttribute("d");
+    if (!d) return null;
+    let m = measured.get(p);
+    if (!m || m.d !== d) measured.set(p, m = { d, L: p.getTotalLength?.() || 0, tips: [], pts: [] });
+    return m;
+  }
+  const pathLength = (p) => measure(p)?.L || 0;
+  // pointAt is the point s along p, read between the points measured every
+  // ptStep along it, each measured once for its d: every flight asked
+  // getPointAtLength three times a frame, and the flights on one wire asked
+  // for the same points again. Between two points 8 px apart, a wire's
+  // curve is off its chord by a fraction of a pixel.
+  const ptStep = 8;
+  function pointAt(p, s) {
+    const m = measure(p);
+    if (!m?.L) return p.getPointAtLength(s);
+    s = Math.max(0, Math.min(m.L, s));
+    const k = Math.floor(s / ptStep), s0 = k * ptStep, s1 = Math.min(m.L, s0 + ptStep);
+    const at = (i, si) => m.pts[i] || (m.pts[i] = p.getPointAtLength(si));
+    const a = at(k, s0);
+    if (s === s0 || s1 <= s0) return a;
+    const b = at(k + 1, s1), f = (s - s0) / (s1 - s0);
+    return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+  }
+
   // tip is where a flight meets a wire's end or start, and which way it
   // heads there: along the wire, or back along it
   const tip = (p, atEnd, back) => () => {
-    const L = p.isConnected && p.getTotalLength?.() || 0;
+    const m = measure(p), L = m?.L;
     if (!L) return null; // not laid out: nowhere to meet it yet
+    const key = (atEnd ? 2 : 0) + (back ? 1 : 0);
+    if (m.tips[key]) return m.tips[key];
     const a = p.getPointAtLength(atEnd ? L : 0), b = p.getPointAtLength(atEnd ? Math.max(0, L - 2) : Math.min(L, 2));
     let tx = atEnd ? a.x - b.x : b.x - a.x, ty = atEnd ? a.y - b.y : b.y - a.y;
     if (back) { tx = -tx; ty = -ty; }
     const n = Math.hypot(tx, ty) || 1;
-    return { x: a.x, y: a.y, tx: tx / n, ty: ty / n };
+    return m.tips[key] = { x: a.x, y: a.y, tx: tx / n, ty: ty / n };
   };
   // via is the way through magpie from one wire to the next: a gentle arc
   // across it, carrying on the way the flight came in and leaving the way
@@ -1155,7 +1195,9 @@ function routingPage(part) {
         c1 = [a.x + a.tx * k + nx * l, a.y + a.ty * k + ny * l];
         c2 = [b.x - b.tx * k + nx * l, b.y - b.ty * k + ny * l];
       }
-      p.setAttribute("d", `M${a.x} ${a.y} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${b.x} ${b.y}`);
+      // set only when it moved: a new d is measured again (measure)
+      const d = `M${a.x} ${a.y} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${b.x} ${b.y}`;
+      if (p.getAttribute("d") !== d) p.setAttribute("d", d);
     };
     j();
     return { p, j };
@@ -2572,6 +2614,7 @@ function routingPage(part) {
       return;
     }
     const lang = document.documentElement.lang, ids = new Set();
+    let redrawn = false; // a row made anew, or the rows moved: metaFit measures them again
     const rowEls = rs.map((r) => {
       const [said, how, tr] = outcome(r);
       const sel = String(pinned ? pinned.id === r.id : cur?.id === r.id);
@@ -2589,6 +2632,7 @@ function routingPage(part) {
         const row = x = { sig, b: reqRow(r, said, how, tr, ag, meta, metrics, title) };
         row.b.onclick = () => pick(row.r); // the request as it is when clicked
         reqRows.set(r.id, x);
+        redrawn = true;
       }
       x.r = r;
       if (x.b.getAttribute("aria-pressed") !== sel) x.b.setAttribute("aria-pressed", sel);
@@ -2605,8 +2649,11 @@ function routingPage(part) {
       els.forEach((e, i) => { if (kids[i] !== e) reqs.insertBefore(e, kids[i] || null); });
       while (kids.length > els.length) reqs.lastElementChild.remove();
       if (reqs.scrollTop !== listTop) reqs.scrollTop = listTop;
+      redrawn = true;
     }
-    metaFit();
+    // measuring every row's line forces a layout: only when one changed
+    // (a resize measures them through the ResizeObserver)
+    if (redrawn) metaFit();
     renderActs(rs);
   }
   function reqRow(r, said, how, tr, ag, meta, metrics, title) {
@@ -3253,7 +3300,7 @@ function routingPage(part) {
   // than a bird banks
   function pose(tr, e) {
     for (const l of tr.legs) if (l.j) l.j();
-    const lens = tr.legs.map((l) => l.p.isConnected && l.p.getAttribute("d") && l.p.getTotalLength?.() || 0);
+    const lens = tr.legs.map((l) => pathLength(l.p));
     const total = lens.reduce((a, b) => a + b, 0);
     const point = (d) => {
       d = Math.max(0, Math.min(total, d));
@@ -3261,7 +3308,7 @@ function routingPage(part) {
       // a leg not laid out has nowhere to be on: passed over
       while (i < lens.length - 1 && (d > lens[i] || !lens[i])) { d -= lens[i]; i++; }
       const l = tr.legs[i];
-      return l.p.getPointAtLength(l.rev ? lens[i] - d : d);
+      return pointAt(l.p, l.rev ? lens[i] - d : d);
     };
     if (!total) return;
     const d = e * total, pt = point(d);
@@ -3542,7 +3589,7 @@ function routingPage(part) {
   // after the requests: a request picked in the list plays on the stage,
   // so the list sits right under it
   more.append(gsec);
-  const ROUTE_OPTS = [["", "Smart"], ["order", "In order"], ["rotate", "In turn"], ["usage", "Least used"], ["pace", "Weekly pace"]];
+  const ROUTE_OPTS = [["", "Smart"], ["order", "In order"], ["rotate", "In turn"], ["usage", "Least used"], ["pace", "Weekly pace"], ["free", "Free first"]];
   // a group may also be routed by hand: every request to the member the
   // user picks on its card (provider.Manual, #317) — a provider's keys can't
   // and by its members' weights, as a provider's keys are (#1910)
@@ -3587,6 +3634,7 @@ function routingPage(part) {
     usage: "Least used first: the account or key with the most of its allowance left goes first.",
     pace: "Weekly pace: the account with the most of its week left per hour until it renews goes first, so less of each member's week is lost at its reset — an account with five hours and no week (Claude Enterprise) by what its five hours have left per hour until they renew, so almost always first; a key by the tokens magpie sent it lately.",
     weight: GROUP_WEIGHT,
+    free: "Free first: the members whose model its vendor serves at no cost to the subscription's allowance or credits go first, then the rest — each whole, over its own accounts or keys as its provider routes them. The free ones are tried before any that spends, so nothing that costs nothing is left unused.",
     manual: "Manual: every request goes to the model you pick on the group's card, over its own accounts or keys; the others, and the rules, wait until you pick another — none takes over when it fails.",
   };
   // a group in the group, and a provider set to route other than Smart, is
@@ -5716,9 +5764,9 @@ function routingPage(part) {
     for (const tr of pTrips) {
       const k = pShown() && !still() ? Math.min(1, Math.max(0, (ts - tr.t0) / tr.ms)) : 1;
       const e = k < .5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
-      const L = tr.n.wire.getTotalLength?.() || 0;
+      const L = pathLength(tr.n.wire);
       if (L) {
-        const pt = tr.n.wire.getPointAtLength((tr.back ? 1 - e : e) * L);
+        const pt = pointAt(tr.n.wire, (tr.back ? 1 - e : e) * L);
         tr.dot.setAttribute("cx", pt.x);
         tr.dot.setAttribute("cy", pt.y);
         tr.dot.removeAttribute("visibility");

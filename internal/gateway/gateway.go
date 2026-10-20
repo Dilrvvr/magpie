@@ -642,6 +642,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/version", s.ollamaVersion)
 	mux.HandleFunc("GET /api/tags", s.ollamaTags)
 	mux.HandleFunc("POST /api/show", s.ollamaShow)
+	// and its chat routes, for a client that chats only through them
+	// (Zed's Ollama provider; ollama_chat.go)
+	mux.HandleFunc("POST /api/chat", s.ollamaChat(false))
+	mux.HandleFunc("POST /api/generate", s.ollamaChat(true))
 	mux.HandleFunc("GET /v1/magpie/quotas", s.quotas)
 	mux.HandleFunc("GET /v1/magpie/usage", s.usageSummary)
 	mux.HandleFunc("GET /v1/magpie/usage/requests", s.usageRequests)
@@ -722,8 +726,15 @@ func responsesOverHTTP(w http.ResponseWriter, r *http.Request) {
 	writeError(w, provider.Responses, http.StatusMethodNotAllowed, "POST /v1/responses")
 }
 
+// catalogSize is how many models the catalog has, as info says, kept by
+// provider.StampNow: every magpie on this computer asks another which
+// it is (ServedBy, a window's every 15s, each look at its state while it
+// doesn't serve), and each question built the whole catalog to count it,
+// 5.4 GB of a day's 36 GB of allocations.
+var catalogSize stamped[struct{}, int]
+
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
-	out := map[string]any{"name": "magpie", "version": Version, "models": len(provider.Catalog()), "window": Window,
+	out := map[string]any{"name": "magpie", "version": Version, "models": catalogSize.get(struct{}{}, func() int { return len(provider.Catalog()) }), "window": Window,
 		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", "/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", "/v1/magpie/trace", SearchMCPPath, VisionMCPPath, ToolsMCPPath}}
 	// which process serves, for another magpie on this computer to name it
 	// on its Routing page (#2606); not told to another machine
@@ -2369,9 +2380,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// while another candidate could answer instead: the last one's
 		// refusal isn't asked again, so holding it only kept a lone relay's
 		// thinking from Claude Code and Codex until the text began, all at
-		// once (iTianbao on X). Gemini's stays held on the last one too,
-		// for a reply that only reasoned to be asked again (#667).
-		hw.thinkingShown = !refusesAfterThinking(c.model) || last && modelFamily(c.model) != ""
+		// once (iTianbao on X). Gemini's goes as it comes there too: a
+		// reply that only reasoned is asked again in place, its reasoning
+		// kept and the next try's after it (streamTranslated, #667), so
+		// holding it kept Codex on a Gemini model with nothing at all,
+		// not even response.created, for the whole of its thinking
+		// (LuckymanJC on Discord).
+		hw.thinkingShown = !refusesAfterThinking(c.model) || last
 		hw.ctx, hw.alive, hw.streams = r.Context(), kept, streams
 		report := cacheReport
 		if c.p.Account == nil || c.p.Account.Agent != "claude" {
@@ -3131,7 +3146,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// rests — it answers as soon as the switch is off. Another member,
 		// its other models among them, is asked
 		zdr := !hw.passing && !hw.refused && hw.code() >= 400 && hw.header.Get(zdrHeader) != ""
-		if protected || zdr {
+		// no room on this computer for another Claude Code process
+		// (#2956): no account's fault, and each Claude account would wait
+		// for the same room, so none rests, none is asked next, nor this
+		// one again after a moment. Another provider left is asked
+		noRoom := hw.failed() && claudeNoRoom(hw.code(), hw.errBody())
+		if protected || zdr || noRoom {
 			if other == nil {
 				other = &Try{Status: call.Status, Error: call.Error}
 			}
@@ -3141,7 +3161,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				left = notMates(cands[i+1:], c)
 			}
 			if len(left) > 0 {
-				try.Fail = failShape
+				if !noRoom {
+					try.Fail = failShape
+				}
 				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 				skipped = append(skipped, c.label()+": "+call.Error)
 				cands = append(cands[:i+1:i+1], left...)
@@ -3151,7 +3173,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			last = true
 		}
 		// nor is it asked again after a moment
-		protected = protected || zdr
+		protected = protected || zdr || noRoom
 		if wait, ok := passing(hw.code(), hw.header, hw.errBody(), again); ok && !protected && !last && hw.failed() && spentAfter(cands[i+1:]) {
 			// the others left are out of their allowance (Discord, waroy: a
 			// Codex account run out, Grok busy a moment): this one is the

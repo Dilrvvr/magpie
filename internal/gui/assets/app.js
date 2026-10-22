@@ -433,7 +433,8 @@ function renderAgents() {
     const fieldBtn = (f, cls) => {
       const b = el("button", "field " + cls);
       const opt = optionFor(f, f.value);
-      b.title = t("{label}: {value}", { label: t(f.label), value: f.value || t("agent default") }) + (opt?.note ? ` · ${opt.note}` : "");
+      b.title = claudePicks(a, f) && !f.value ? t("{label}: {value}", { label: t(f.label), value: t(AUTO_MODE_UNSET) }) + "\n" + t(CLAUDE_PICKS)
+        : t("{label}: {value}", { label: t(f.label), value: f.value || t("agent default") }) + (opt?.note ? ` · ${opt.note}` : "");
       if (f.value && opt?.direct) b.title += "\n" + directSaid(a, opt);
       const effort = f.key === "effort" || f.label === "effort" || f.label === "thinking" || TIER_EFFORTS.includes(f.label);
       if (opt?.icon || opt?.icons?.length) b.append(optionIcon(opt));
@@ -443,7 +444,7 @@ function renderAgents() {
       else if (!f.value && !f.menu && a.icon) b.append(icon(a.icon));
       else if (!wide(f) || !f.value) b.append(el("span", "k", t(f.label)));
       if ((f.label === "executor" || f.label === "planner") && !b.querySelector(".k")) b.append(el("span", "k", t(f.label)));
-      const shown = f.menu ? f.summary : effort ? effortName(opt || { value: f.value }) : (opt?.label || f.value || t(FOLLOWS_MODEL.includes(f.label) ? "same as model" : "default"));
+      const shown = f.menu ? f.summary : effort ? effortName(opt || { value: f.value }) : (opt?.label || f.value || t(claudePicks(a, f) ? AUTO_MODE_UNSET : FOLLOWS_MODEL.includes(f.label) ? "same as model" : "default"));
       if (f.menu) b.title = f.options.map((o) => `${o.label}: ${o.note}`).join("\n");
       b.append(el("span", "v" + (f.value || f.custom ? "" : " empty"), shown));
       if (f.value && opt?.fast) b.append(fastTag(opt.ultra));
@@ -3703,8 +3704,14 @@ const SUB_MODEL = "subagent model";
 // pick, not the model's
 const AUTO_MODE = "auto mode";
 const AUTO_MODE_UNSET = "Claude Code's own pick";
-const leadPicks = (a, f) => f.label === "subagents" && a.id.split("@wsl:")[0] === "codex";
+const leadPicks = (a, f) => f.label === "subagents" && ["codex", "claude"].includes(a.id.split("@wsl:")[0]);
 const LEAD_PICKS = "Codex's lead may name another model for a subagent; set the subagent model to hold every subagent to one";
+// Claude Code's subagents unset: magpie writes no CLAUDE_CODE_SUBAGENT_MODEL
+// and Claude Code picks, taking the Agent call's model, then the subagent's
+// own model:, then that variable, then the session's (2.1.306), so it is
+// its pick, not "same as model" (KorenKrita on Discord)
+const CLAUDE_PICKS = "Claude Code's lead, or a subagent's own definition, may name a model or tier for it; a model set here is for the subagents that name none";
+const claudePicks = (a, f) => leadPicks(a, f) && a.id === "claude";
 const extra = (f) => f.key === "tiers" || FOLLOWS_MODEL.includes(f.label) || f.label === "sign-in" || f.key === "ultracode" || f.label === SUB_EFFORT || f.label === SUB_MODEL || f.label === AUTO_MODE || f.label === MEMORIES;
 const EXTRA_GLYPH = {
   subagents: "M4.5 2.75v10.5M4.5 9.25c0-2.2 1.6-3.75 3.9-3.75h3.35M9.9 3.6l1.9 1.9-1.9 1.9",
@@ -3733,7 +3740,7 @@ function extraField(a, f) {
   b.append(svg(EXTRA_GLYPH[f.label] || EXTRA_GLYPH.tiers, 13, 1.5));
   const opt = optionFor(f, f.value);
   b.title = f.label === SUB_EFFORT ? subEffortTitle(a, f, opt) : f.menu ? menuTitle(f)
-    : t("{label}: {value}", { label: f.label === MEMORIES ? t("Codex memories model") : t(f.label), value: t(opt?.label || f.value || (f.label === MEMORIES ? MEMORIES_DEFAULT : f.label === SUB_MODEL ? "the model the lead asks for" : f.label === AUTO_MODE ? AUTO_MODE_UNSET : leadPicks(a, f) ? "the lead's pick, else same as model" : "same as model")) }) + (opt?.note && !FOLLOWS_MODEL.includes(f.label) ? "\n" + t(opt.note) : "") + (leadPicks(a, f) ? "\n" + t(LEAD_PICKS) : "");
+    : t("{label}: {value}", { label: f.label === MEMORIES ? t("Codex memories model") : t(f.label), value: t(opt?.label || f.value || (f.label === MEMORIES ? MEMORIES_DEFAULT : f.label === SUB_MODEL ? "the model the lead asks for" : f.label === AUTO_MODE ? AUTO_MODE_UNSET : leadPicks(a, f) ? "the lead's pick, else same as model" : "same as model")) }) + (opt?.note && !FOLLOWS_MODEL.includes(f.label) ? "\n" + t(opt.note) : "") + (leadPicks(a, f) ? "\n" + t(claudePicks(a, f) ? CLAUDE_PICKS : LEAD_PICKS) : "");
   b.setAttribute("aria-label", b.title);
   b.dataset.key = f.key;
   b.onclick = (ev) => openPicker(a, f, b, ev);
@@ -4600,7 +4607,8 @@ function openPicker(agent, field, anchor, ev, only) {
   if (FOLLOWS_MODEL.includes(field.label)) {
     const main = agent.fields.find((f) => f.key === "model");
     const mainName = main && (optionFor(main, main.value)?.label || main.value);
-    options.unshift(main && leadPicks(agent, field) ? { value: "", label: t("Lead's pick"), note: t("{model} unless the lead names another", { model: mainName }), icon: optionFor(main, main.value)?.icon, reset: true }
+    options.unshift(main && claudePicks(agent, field) ? { value: "", label: t(AUTO_MODE_UNSET), note: t("{model} unless the lead or the subagent names another", { model: mainName }), icon: agent.icon, reset: true }
+      : main && leadPicks(agent, field) ? { value: "", label: t("Lead's pick"), note: t("{model} unless the lead names another", { model: mainName }), icon: optionFor(main, main.value)?.icon, reset: true }
       : main ? { value: "", label: t("Same as model"), note: mainName, icon: optionFor(main, main.value)?.icon, reset: true }
       : { value: "", label: t("Not set"), note: t("a Claude model of the tier, else the chat's model"), icon: agent.icon, reset: true });
   } else if (!only && !field.menu && !field.onPick && !options.some((o) => o.value === "")) {
@@ -7634,6 +7642,7 @@ function providerDraftValue() {
 function providerDirty() {
   // Price boxes parse on change; a page closed while typing hasn't blurred one yet.
   const active = document.activeElement;
+  if (accountModelsDraft(providers?.providers?.find((p) => p.id === editing)) !== null) return true;
   return !!draft && draft === providerDraftRef && (providerDraftValue() !== providerDraftBase ||
     (active?.matches(".editor .mprice input") && active.value !== active.defaultValue));
 }
@@ -7707,7 +7716,7 @@ function confirmDiscard() {
 async function cancelEdit(keep) {
   if ((providerDirty() || ((importing || importingApps) && modalFormDirty())) && !(await confirmDiscard())) return false;
   if (keep !== true) dropSigningIn(editing);
-  editing = null; draft = null; importing = null; importingApps = null; renderProviders();
+  editing = null; draft = null; acctModels = null; importing = null; importingApps = null; renderProviders();
   return true;
 }
 window.addEventListener("beforeunload", (e) => {
@@ -9299,9 +9308,11 @@ function drawEditor(p, presetID) {
       const priceRate = priceRateOfDraft();
       if (priceRate === undefined) return priceRateError(ed);
       if (priceTypedError(ed)) return;
+      const picked = accountModelsDraft(p);
+      if (picked === false) return editorError(t("Pick at least one model for the account, or choose All models"), "warn");
       const body = { id: p.id, models: chosenIds(), noModels: noneChosen(), unlisted: draft.unlisted, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, proxy, accountProxies: own.map, maxConcurrency, ...queue, priceRate, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, ...(p.carriesCompaction ? { nativeCompaction: !!draft.nativeCompaction } : {}), ...routingOfDraft(p) };
       saving(saveBtn, t("Saving…"));
-      savePluginOptions(subOf(a.agent)).then(() => providerAction("save", body, t("{name} saved", { name: p.name })), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); }); };
+      saveAccountModelsDraft(picked).then(() => savePluginOptions(subOf(a.agent))).then(() => providerAction("save", body, t("{name} saved", { name: p.name })), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); }); };
     bar.append(cancel, saveBtn);
     ed.append(bar);
     return ed;
@@ -9970,8 +9981,11 @@ function drawEditor(p, presetID) {
       Object.assign(body, movedURLs(draft));
     }
     editorError("");
+    const picked = accountModelsDraft(p);
+    if (picked === false) return editorError(t("Pick at least one model for the account, or choose All models"), "warn");
     saving(saveBtn, t(isNew ? "Adding…" : "Saving…"));
-    providerAction("save", body, t(isNew ? "{name} added" : "{name} saved", { name: draft.name || draft.id }));
+    const okMsg = t(isNew ? "{name} added" : "{name} saved", { name: draft.name || draft.id });
+    saveAccountModelsDraft(picked).then(() => providerAction("save", body, okMsg), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); });
   };
   saveBtn.onclick = save;
   bar.append(cancel, saveBtn);
@@ -11990,7 +12004,7 @@ function pluginMethod(sub, site) {
 // magpie, signs in and carries the requests.
 function pluginSubs() {
   return (providers.plugins || []).map((x) => ({
-    agent: x.id, pid: x.pid, name: x.name, icon: x.icon, plugin: x, own: true,
+    agent: x.id, pid: x.pid, name: x.name, icon: x.icon, plugin: x, own: true, single: !!x.single,
     get plans() { return t("from the plugin {spec}", { spec: x.spec }); },
   }));
 }
@@ -12167,7 +12181,8 @@ async function startPluginSignIn(sub, method, inputs = {}, o = {}) {
       return renderProviders();
     }
     if (ms[method].type === "api") {
-      signing = { agent: sub.agent, ...keep, state: "key" };
+      signing = { agent: sub.agent, ...keep, state: ms[method].keyless === true ? "starting" : "key" };
+      if (ms[method].keyless === true) return pluginKey(sub, "");
       return renderProviders();
     }
     const body = { provider: sub.pid, method, inputs };
@@ -12211,7 +12226,7 @@ async function pluginKey(sub, key) {
     const st = await api("plugin-signin", { provider: sub.pid, method: flow.method, inputs: flow.inputs, key });
     if (signing?.agent === sub.agent) signedIn(st);
   } catch (e) {
-    if (signing?.agent === sub.agent) { signing = { ...flow, error: e.message }; renderProviders(); }
+    if (signing?.agent === sub.agent) { signing = { ...flow, state: flow.state === "starting" ? "failed" : flow.state, error: e.message }; renderProviders(); }
   }
 }
 
@@ -13081,7 +13096,7 @@ function renderAccounts(a, p) {
     const add = el("button", "acc add");
     const ic = el("span", "dot");
     ic.append(svg(PLUS, 10, 1.8));
-    add.append(ic, el("span", "n", t(sub.single ? "Sign in to another {name} account" : "Add another {name} account", { name: sub.name })));
+    add.append(ic, el("span", "n", t(sub.single && sub.plugin ? "Sign in again" : sub.single ? "Sign in to another {name} account" : "Add another {name} account", { name: sub.name })));
     add.onclick = () => startSignIn(a.agent);
     list.append(add);
     if (sub.importable) {
@@ -14089,9 +14104,25 @@ async function accountAction(path, body, okMsg, confirmed = false) {
 // provider's, as before. The pill on its row says which it serves; a click
 // opens the provider's models under it as chips, picked and saved apart
 // from the editor's Save. acctModels is the row being picked: { id, ref,
-// chosen }.
+// chosen }. Picks left unsaved there go with the editor's Save, which says
+// it saved them (#2862).
 let acctModels = null;
 function accountModelsOf(p, ref) { return p.accountModels?.[String(ref).toLowerCase()] || []; }
+// accountModelsDraft: what the open picker of p's has picked and not saved,
+// as provider/accountmodels takes it; null when nothing, false when it has
+// every model unpicked, which no Save keeps.
+function accountModelsDraft(p) {
+  const a = acctModels;
+  if (!p || a?.id !== p.id) return null;
+  const own = accountModelsOf(p, a.ref);
+  if (own.length === a.chosen.length && a.chosen.every((id) => own.includes(id))) return null;
+  return a.chosen.length ? { id: p.id, account: a.ref, allow: [...a.chosen] } : false;
+}
+async function saveAccountModelsDraft(body) {
+  if (!body) return;
+  await api("provider/accountmodels", body);
+  acctModels = null;
+}
 // It gives the pill, and the open picker the row ends with, or null.
 function accountModels(p, ref, isKey, name) {
   const own = accountModelsOf(p, ref);
@@ -17666,8 +17697,10 @@ function checkinRow(q, first, subs) {
     }
   };
   row.append(auto);
-  // pressed now: shown while an account isn't in today and could be
-  const due = subs.filter((x) => x.checkins && !x.checkinOff && (x.checkinBy || "") === by && !(x.checkin?.day === today && x.checkin.outcome !== "failed"));
+  // pressed now: shown while an account isn't in today and could be; a
+  // Qoder campaign can open later in the day, so its inactive too (#2696)
+  const later = /^(plugin:)?qoder(-cn)?$/.test(by);
+  const due = subs.filter((x) => x.checkins && !x.checkinOff && (x.checkinBy || "") === by && !(x.checkin?.day === today && x.checkin.outcome !== "failed" && !(later && x.checkin.outcome === "inactive")));
   if (due.length) {
     const now = el("button", "text ci-now", t("Check in now"));
     now.type = "button";
@@ -17679,7 +17712,7 @@ function checkinRow(q, first, subs) {
       try {
         const rs = await api("usage/" + vendor.api, vendor.plugin ? { provider: vendor.plugin } : {});
         const bad = (rs || []).filter((x) => x.outcome === "failed").length;
-        status(bad ? t("Check-in failed for {n} account(s)", { n: bad }) : t("Checked in"), bad ? "err" : "ok");
+        status(bad ? t("Check-in failed for {n} account(s)", { n: bad }) : t("Check-in status refreshed"), bad ? "err" : "ok");
       } catch (err) {
         status(err.message, "err");
       }
@@ -20885,6 +20918,12 @@ function renderAgentPrefLinks() {
   const box = $("#agentPrefLinks");
   box.replaceChildren();
   homeAgentPrefRows();
+  // Long conversations sets the windows the gateway serves, which an agent
+  // on another computer reads too: with no Codex or Claude Code here to
+  // hold it (a gateway, magpie in Docker) it stays in Settings (Linka)
+  const loose = $("#fullContextRow");
+  if (!state.agents.some((a) => agentPrefsOf(a)?.includes(loose.id))) box.before(loose);
+  else if (loose.parentElement === box.parentElement) $("#agentPrefRows").append(loose);
   for (const r of agentPrefRowEls) {
     const agents = state.agents.filter((a) => agentPrefsOf(a)?.includes(r.id) && !a.id.includes("@wsl:"));
     if (!agents.length || (r.id === "codexMemoriesRow" && r.hidden)) continue;
@@ -21814,6 +21853,9 @@ function renderRedact(s, keep) {
   i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") save(); else if (e.key === "Escape") { i.value = words; i.blur(); } };
   i.onblur = save;
   row(t("Masked words"), t("Your own words to keep from vendors, separated by commas"), i);
+  // plain words, matched as written unless the user asks for any case
+  row(t("Masked words in any case"), t("A word also matches in other capitals: Nightjar masks NIGHTJAR and nightjar too"),
+    onOff(s.redactWordsAnyCase, (redactWordsAnyCase) => savePrefs({ ...keep, redactWordsAnyCase }))).id = "redactWordsAnyCaseRow";
   renderRedactRules(s, row);
   renderMaskActions(s);
   renderMaskTry(s);
@@ -21917,7 +21959,6 @@ const MASK_BY = { rule: "Rules", yours: "Your rules", word: "Your words", model:
 // what a request was, beside a chat (gateway's noteMasked)
 const MASK_WHAT = { search: "Web search", image: "Image", video: "Video", decide: "System One", embeddings: "Embeddings", audio: "Audio" };
 const SHIELD = "M8 1.8 13 3.6v4.1c0 3-2.1 5.4-5 6.5-2.9-1.1-5-3.5-5-6.5V3.6Z";
-const SPARK = "M7 2.2c.5 2.9 1.4 3.8 4.3 4.3-2.9.5-3.8 1.4-4.3 4.3-.5-2.9-1.4-3.8-4.3-4.3 2.9-.5 3.8-1.4 4.3-4.3Z M12.2 10.2c.2 1.1.6 1.5 1.7 1.7-1.1.2-1.5.6-1.7 1.7-.2-1.1-.6-1.5-1.7-1.7 1.1-.2 1.5-.6 1.7-1.7Z";
 const PLACEHOLDER = /\{\{[^{}\s]{1,64}\}\}/g;
 let maskS = null;            // the settings the card was drawn with
 let maskSum = null, maskSumDays = 0, maskAt = 0, maskBusy = null, maskBusyDays = 0;
@@ -22219,15 +22260,9 @@ function maskLedger(title, kind, rows, move) {
   rows.forEach((r, i) => {
     const b = el("button", "mo-row" + (r.model ? " model" : ""));
     b.type = "button";
-    if (r.model) {
-      const sp = el("span", "mo-spark");
-      sp.append(svg(SPARK, 12, 1.3));
-      b.append(sp);
-    } else {
-      const d = el("span", "mo-dotc");
-      d.style.background = r.c || "var(--faint)";
-      b.append(d);
-    }
+    const d = el("span", "mo-dotc");
+    d.style.background = r.c || (r.model ? "var(--c6)" : "var(--faint)");
+    b.append(d);
     const m = el("span", "mo-meter"), f = el("i");
     f.style.width = (100 * r.n) / max + "%";
     if (r.c) f.style.background = r.c;
@@ -23558,7 +23593,7 @@ function prefsKeep(s) {
     uiFont: s.uiFont || null, codeFont: s.codeFont || null,
     otel: s.otel || {},
     trayUsages: s.trayUsages || [],
-    redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactKinds: s.redactKinds || {}, redactWords: s.redactWords || [], codexWarmup: s.codexWarmup || "",
+    redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactKinds: s.redactKinds || {}, redactWords: s.redactWords || [], redactWordsAnyCase: !!s.redactWordsAnyCase, codexWarmup: s.codexWarmup || "",
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "",
     codexWarmAts: warmTimes(s.codexWarmAts, s.codexWarmAt), claudeWarmAts: warmTimes(s.claudeWarmAts, s.claudeWarmAt), workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, minimaxCheckin: !!s.minimaxCheckin, qoderCheckin: !!s.qoderCheckin, noStats: !!s.noStats, noUsageStats: !!s.noUsageStats,
     memberModel: !!s.memberModel, noLoopGuard: !!s.noLoopGuard, claudeLeanPrompt: !!s.claudeLeanPrompt, refusalRetries: s.refusalRetries ?? null,
@@ -23872,10 +23907,12 @@ function hold(h) {
     // what was clicked moves it down rather than scrolling the view to follow
     // it. Turning automatic updates off grew the Version row above the
     // switch once the save answered, and the view slid 2px off its top (#2134).
-    // Only while what was clicked stays under the pointer, moved by less than
-    // half its height: a day picked on Routing brings its stage in above the
-    // bar (~138px), and the bar is held where it was clicked (#961)
-    if (h.top && want > 0 && Math.abs(d) < a[0].getBoundingClientRect().height / 2) want = 0;
+    // Only while what was clicked moved by less than its height, a line come
+    // in above it: a day picked on Routing brings its stage in above the bar
+    // (~138px), and the bar is held where it was clicked (#961). Half its
+    // height was too little once a settings row kept 12px above and below its
+    // words: the Version row's line grew it 12px past a 22px switch (10-22)
+    if (h.top && want > 0 && Math.abs(d) < a[0].getBoundingClientRect().height) want = 0;
     // a view at its top when clicked stays there rather than be given room
     // to scroll down: a chip saved in the panel's Profiles came in above the
     // button held, and room made for the button slid the chip up under the

@@ -1045,6 +1045,10 @@ function routingPage(part) {
     if (tr.fail === "slow")
       return !next && r.done
         ? t("{who} hadn't begun answering after {ms}, and nobody is left to try, so {agent} gets the error.", { who: name, ms: took(tr.ms), agent })
+        // slow again and again on this account: its model rests here
+        : tr.rest
+        ? t("{who} hadn't begun answering after {ms}, {n} times in a row, so the request went on to the next before any of it reached {agent}. It rests {d} for {model} alone, longer each time it is slow again; its other models answer as before.",
+          { who: name, ms: took(tr.ms), n: tr.rest.failures, model: tr.rest.model || tr.model, d: dur(at(tr.rest.until) - at(tr.start) - (tr.ms || 0)), agent })
         : t("{who} hadn't begun answering after {ms}, so the request went on to the next before any of it reached {agent}. Nothing is wrong with {who}, so it doesn't rest.", { who: name, ms: took(tr.ms), agent });
     if (tr.fail === "proxy")
       return r.tries[i + 1]
@@ -2006,40 +2010,43 @@ function routingPage(part) {
     bodies.replaceChildren(grid);
   }
   // holdStory keeps the story of the live request, its head and its lines,
-  // as tall as the tallest of the last few requests answered, at this
+  // as tall as the tallest of the last few requests told, at this
   // width: a request under way is told in fewer lines than one answered
   // ("is answering…", then "answered in 4.0 s…" over two lines at a
   // phone's width), and its head gets View usage and Replay, taller than
   // the words, once it is done. So each new request moved the context
   // window under it up and back down (dumplings on Discord: the card
-  // jittered on every request). Only the last STORY_HELD answered count: one
+  // jittered on every request). Only the last STORY_HELD told count: one
   // told in many lines (a request handed on from member to member) no
   // longer holds the box that tall for good, and it shrinks back once
   // that many shorter ones have come after it (夜松云 on Discord: the box
-  // grew and never shrank back). A request picked, a replay or a past day
-  // is drawn at its own height. A change of width measures it again at
+  // grew and never shrank back). Each request told counts, answered or
+  // under way, at the height it has now: on a busy gateway a request is
+  // answered as the next starts, the two come in one trace, and the
+  // newest is always under way, so counting only those told answered
+  // held the long one for good (shensmart on Discord, a remote magpie in
+  // a local browser: the room grew with use). A request picked, a replay
+  // or a past day is drawn at its own height. A change of width measures it again at
   // once, as it is then (the list coming in under it can take a
   // scrollbar's width off it before the first live request)
   const STORY_HELD = 3;
-  let storyHold = { key: "", done: new Map() }, storyDrawn = "";
+  let storyHold = { key: "", told: new Map() }, storyDrawn = "";
   function holdStory() {
     const follow = !pinned && !rp && !day;
     const w = steps.clientWidth;
     const key = JSON.stringify([follow, w, document.documentElement.lang]);
     if (key === storyHold.key && storyDrawn === headKey + stepsKey) return;
-    if (key !== storyHold.key) storyHold = { key, done: new Map() };
+    if (key !== storyHold.key) storyHold = { key, told: new Map() };
     storyDrawn = headKey + stepsKey;
     [logHead, steps].forEach((e) => { e.style.minHeight = ""; });
     if (!follow || !w || !logR) return;
     const hs = [logHead, steps].map((e) => e.getBoundingClientRect().height);
-    // an answered request's own height, kept by its id: the last few only
-    if (logR.done) {
-      storyHold.done.set(logR.id, hs);
-      const ids = [...storyHold.done.keys()].sort((x, y) => y - x);
-      for (const id of ids.slice(STORY_HELD)) storyHold.done.delete(id);
-    }
+    // a request's own height as told now, kept by its id: the last few only
+    storyHold.told.set(logR.id, hs);
+    const ids = [...storyHold.told.keys()].sort((x, y) => y - x);
+    for (const id of ids.slice(STORY_HELD)) storyHold.told.delete(id);
     [logHead, steps].forEach((e, i) => {
-      const held = Math.max(0, ...[...storyHold.done.values()].map((h) => h[i]));
+      const held = Math.max(0, ...[...storyHold.told.values()].map((h) => h[i]));
       if (held > hs[i]) e.style.minHeight = held + "px";
     });
   }
@@ -5096,7 +5103,7 @@ function routingPage(part) {
       firstIn.hidden = firstUnit.hidden = firstMode !== "custom";
       firstIn.setAttribute("aria-invalid", String(!!firstErr));
       fHint.textContent = firstErr || (d.firstToken
-        ? t("A member that hasn't begun answering after {n} — no text, reasoning or tool call yet — is let go and the next one asked, before any of it reaches the agent. It doesn't rest; the last one left is always waited for. Only for streamed requests.", { n: took(d.firstToken * 1000) })
+        ? t("A member that hasn't begun answering after {n} — no text, reasoning or tool call yet — is let go and the next one asked, before any of it reaches the agent. Let go once, it doesn't rest; let go twice in a row, its model rests on that account, a minute and longer each time, until it answers again. The last one left is always waited for. Only for streamed requests.", { n: took(d.firstToken * 1000) })
         : t("Every member is waited for, however long it takes to begin answering."));
     };
     fw.append(segs([...FIRST_OPTS.map(([n, l]) => [n, t(l)]), ["custom", t("Custom")]], firstMode, (v) => {

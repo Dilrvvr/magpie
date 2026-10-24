@@ -699,6 +699,9 @@ func (s *Server) Handler() http.Handler {
 	// a CPU profile of this process over some seconds, for magpie cpu
 	// (loopback only)
 	mux.HandleFunc("GET "+CPUPath, s.cpuProfile)
+	// every goroutine's stack and wait, for magpie goroutines (loopback
+	// only)
+	mux.HandleFunc("GET "+GoroutinesPath, s.goroutineDump)
 	mux.HandleFunc("GET /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("OPTIONS /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("POST /v1/chat/completions", s.handle(provider.Chat))
@@ -1493,6 +1496,10 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 			}
 			if to := codexDescriptionsTo(r.Header, body, true); to != "" {
 				s.codexDescription(w, r, body, to)
+				return
+			}
+			if to := codexSummariesTo(r.Header, body, true); to != "" {
+				s.codexSummary(w, r, body, to)
 				return
 			}
 			if to := codexPredictionsTo(r.Header, body, true); to != "" {
@@ -2351,6 +2358,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	var forbade []forbidden           // the plain 403s rested so far (forbiddenAlike)
 	autoReset := resetFirst != nil    // a Codex or Claude reset looked at, once a request
 	creditsAsked := map[string]bool{} // Codex accounts asked again onto their credits, once each (creditsAgain)
+	// the subscription/model pairs an account refused as a model it doesn't
+	// serve, for the accounts whose own list lacks it to be asked next
+	// (unlistedNext); none for a request pinned to an account, a
+	// conversation sealed to one or kept strictly on one
+	unservedBy := map[string]bool{}
+	unlisted, unlistedW := pl.unlisted, pl.unlistedW
+	if pin != "" || checkpoint != nil || aff.Why == "strict" {
+		unlisted, unlistedW = nil, nil
+	}
 	// what the tries' held streams sent the agent ahead of a reply (#751)
 	kept := &keptAlive{proto: from, told: start}
 	if k := handedOnOf(r); k != nil {
@@ -3034,7 +3050,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 					Requested: call.Model, Served: call.Usage.Served, Upstream: call.Usage.Upstream,
 					Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: try.Millis, Status: call.Status,
+					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, CacheUnknown: call.Usage.billed().cacheNotCounted(), Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: try.Millis, Status: call.Status,
 					TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
@@ -3078,7 +3094,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 					Requested: call.Model, Served: call.Usage.Served,
 					Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: try.Millis, Status: call.Status,
+					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, CacheUnknown: call.Usage.billed().cacheNotCounted(), Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: try.Millis, Status: call.Status,
 					TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
@@ -3343,6 +3359,42 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			skipped = append(skipped, c.label()+": "+call.Error+" (asked again, to spend its credits)")
 			i--
 			continue
+		}
+		if hw.failed() && !hw.passing && len(unlisted) > 0 && unservedTry(c, hw.code(), hw.errBody()) {
+			unservedBy[c.p.ID+"/"+c.model] = true
+		}
+		if key := c.p.ID + "/" + c.model; unservedBy[key] && hw.failed() && !hw.passing && !hw.turnedAway && !hw.refused && !outgrew &&
+			!slices.ContainsFunc(cands[i+1:], func(x candidate) bool { return x.p.ID+"/"+x.model == key }) {
+			// every account of the subscription that lists the model has
+			// been asked, and one refused it as a model it doesn't serve:
+			// its accounts whose own list lacks it are asked next, before
+			// any other member, as a list fetched before the account was
+			// given the model is stale (01huadalang on Discord: Gemini 4
+			// on one Antigravity account of several), rather than the
+			// agent told the first one's error. The one that refused
+			// rests, for that model alone
+			var next []candidate
+			var nextW []Weighed
+			next, nextW, unlisted, unlistedW = unlistedNext(unlisted, unlistedW, key)
+			if len(next) > 0 && last {
+				if f := failure(hw.code(), hw.errBody()); other == nil && f != failQuota && f != failCredit {
+					other = &Try{Status: call.Status, Error: call.Error}
+				}
+				rest := s.restAfterMarked(c, hw.code(), hw.header, hw.errBody(), hw.sharedPool)
+				try.Fail, try.Rest = rest.Why, &rest
+				s.trace.update(tr, func(t *Route) {
+					t.Tries[len(t.Tries)-1] = try
+					t.Order, t.Left = askUnlisted(t.Order, t.Left, c, nextW)
+				})
+				skipped = append(skipped, c.label()+": "+call.Error)
+				cands = append(cands[:len(cands):len(cands)], next...)
+				continue
+			}
+			if len(next) > 0 {
+				// the rest of the order after them; this try is rested below
+				cands = slices.Concat(cands[:i+1], next, cands[i+1:])
+				s.trace.update(tr, func(t *Route) { t.Order, t.Left = askUnlisted(t.Order, t.Left, c, nextW) })
+			}
 		}
 		if !last && hw.failed() {
 			if f := failure(hw.code(), hw.errBody()); other == nil && f != failQuota && f != failCredit {
@@ -3653,7 +3705,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 			Requested: call.Model, Served: call.Usage.Served, Upstream: call.Usage.Upstream,
 			Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-			CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: call.Millis, Status: call.Status,
+			CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, CacheUnknown: call.Usage.billed().cacheNotCounted(), Reasoning: call.Usage.billed().Reasoning, Credits: call.Usage.Credits, Effort: wentAt, Millis: call.Millis, Status: call.Status,
 			TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 			TTFT: call.TTFT, FirstText: call.FirstText, FirstReasoning: call.FirstReasoning, ReasoningHidden: call.ReasoningHidden, Flow: call.Flow, Sent: sentMs, Own: ownMs, Retried: retriedMs, Queued: queuedMs, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 			RequestID: call.Usage.RequestID, ResponseID: call.Usage.ResponseID, Endpoint: endpointOf(r, from, call.To, lastTried, model), Stop: call.Usage.Stop, Archive: call.archiveName()}
@@ -4023,10 +4075,13 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		m := gjson.GetBytes(body, "model").String()
 		base = provider.MantleBase(base, m, !s.fits(p.ID, mantleRouteKey(m), to))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, nil)
 	if err != nil {
 		return nil, err
 	}
+	// the body goes once it is answered, not when a stream ends (#3383)
+	provider.SetBody(req, body)
+	defer provider.LetGo(req)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	// magpie's, or the agent's own where the provider is set to pass it
@@ -6616,7 +6671,7 @@ func conversationID(in http.Header, body []byte) string {
 		Contents json.RawMessage `json:"contents"`
 	}
 	// An undecodable body still gets an id: the hash of the whole body.
-	_ = decodeJSON(body, &m)
+	_ = decodeJSONView(body, &m)
 	// The turns are the body's own bytes, not a copy of each: this runs on
 	// every request, and a 1.5 MB conversation's copy was ~2.8 MB of each
 	// request's allocations (yg6888 on X).
@@ -6637,7 +6692,7 @@ func conversationID(in http.Header, body []byte) string {
 			Role string `json:"role"`
 		}
 		// Gemini treats an omitted role as user; Chat and Responses do not.
-		if decodeJSON(it, &r) == nil && (r.Role == "user" || (geminiContents && r.Role == "")) {
+		if decodeJSONView(it, &r) == nil && (r.Role == "user" || (geminiContents && r.Role == "")) {
 			first = it
 			break
 		}

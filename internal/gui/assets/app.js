@@ -137,6 +137,7 @@ async function api(path, body, heads, signal) {
       err.message = t("None of magpie's models is left in {agent}'s model list: pick one under Model list → Pick, then connect {agent}", { agent: data.agent });
     }
     if (data?.why) err.why = data.why; // a failed move's reason, said in the reader's language
+    if (data?.code === "bun_unstartable") err.message = t(data.said); // bunSaid in api.go: an i18n.js key
     // an account the agent is signed in to, refused removal while it has
     // another: said in the reader's language
     if (data?.code === "signed_in") {
@@ -15502,7 +15503,9 @@ function fmtN(n) {
 let currency = "usd";
 let fx = { rate: 0, at: null, stale: true };
 function fmtCost(t) {
-  if (!t.cost && t.unpriced) return "";
+  // no cost read (null, or a reply without one) is unknown: nothing shown,
+  // not $0 and not a throw that stops the page drawing (#3406)
+  if (typeof t.cost !== "number" || (!t.cost && t.unpriced)) return "";
   let c = t.cost, sign = "$";
   if (currency === "cny" && fx.rate > 0) { c = c * fx.rate; sign = "¥"; }
   const s = c >= 100 ? c.toFixed(0) : c >= 1 ? c.toFixed(2) : c.toFixed(3);
@@ -21227,17 +21230,17 @@ function renderImages(s, keep) {
   r.append(who, val);
   box.append(r);
   renderImageGen(s, keep, box);
-  // the same image recognition as an MCP server of the gateway's (JonahFu
-  // on X), for an agent to mount as its analyze_image tool
-  const mcpURL = mcpAddress(s, "/mcp/magpie/vision");
-  const mcp = el("div", "row pref");
-  const mwho = el("div", "who");
-  mwho.append(el("div", "name", t("Image recognition MCP server")), el("div", "sub", t("Agents can add image recognition as an MCP server (Streamable HTTP) with one analyze_image tool, which reads an image with the Image recognition model from a file path, a URL or a data URL. From another computer, send a gateway key as Authorization: Bearer <key> and the image as a URL or data URL.")));
-  const mval = el("div", "val");
-  mval.append(el("code", "", mcpURL), copyBtn(mcpURL, t("Address")));
-  mcp.append(mwho, mval);
-  mcp.id = "visionMcpRow";
-  box.append(mcp);
+  // both as the gateway's MCP servers, for an agent with no Library (JonahFu on X)
+  const mcpRow = (id, path, name, sub) => {
+    const url = mcpAddress(s, path), r = el("div", "row pref"), who = el("div", "who"), val = el("div", "val");
+    who.append(el("div", "name", name), el("div", "sub", sub));
+    val.append(el("code", "", url), copyBtn(url, t("Address")));
+    r.append(who, val);
+    r.id = id;
+    box.append(r);
+  };
+  mcpRow("visionMcpRow", "/mcp/magpie/vision", t("Image recognition MCP server"), t("Agents can add image recognition as an MCP server (Streamable HTTP) with one analyze_image tool, which reads an image with the Image recognition model from a file path, a URL or a data URL. From another computer, send a gateway key as Authorization: Bearer <key> and the image as a URL or data URL."));
+  mcpRow("imageMcpRow", "/mcp/magpie/image", t("Image generation MCP server"), t("Agents can add image generation as an MCP server (Streamable HTTP) with generate_image, generate_video and generation_result tools, which draw with the Image generation model. An image comes back in the answer and at a URL kept for an hour, a video at a URL; nothing is saved in the agent's project. From another computer, send a gateway key as Authorization: Bearer <key>."));
 }
 
 // renderImageGen: the model magpie's generate_image tool draws with — the
@@ -21266,7 +21269,7 @@ function renderImageGen(s, keep, box) {
   const libOff = featuresOff.has("library");
   const sub = el("div", "sub wraps",
     v === "off" ? t("Agents given Magpie Image can't generate images or videos: the tool says it is off")
-    : gatewayMode ? t("The model Magpie Image draws with, for the agents given the Magpie Image tool; images are saved in their project")
+    : gatewayMode ? t("The model the Image generation MCP server below draws with, for the agents that add it; images come back in their answer")
     : libOff ? t("The model Magpie Image draws with. Agents get the Magpie Image tool from the Library, which is turned off in Plugins › Built-in; images are saved in their project")
     : t("The model Magpie Image draws with. Agents get the Magpie Image tool from the Library; images are saved in their project"));
   who.append(el("div", "name", t("Image generation")), sub);
@@ -21654,7 +21657,7 @@ function renderSearcher(s, keep, box) {
   // the one named didn't search last time, and no other provider searched
   // in its place (Gearclickist on Discord: Grok picked answered without
   // searching, and Codex's pricier model searched instead, unasked). First,
-  // so the one-line help's ellipsis doesn't hide it.
+  // so it reads before the help.
   const failed = s.searchFailed;
   if (!off && v && !s.searchUnused && failed) {
     const why = failed.notSearched ? t("it answered without searching the web, so its account or plan may not offer web search") : failed.nothingFound ? t("its reply named no page it found") : failed.why || t("it failed");

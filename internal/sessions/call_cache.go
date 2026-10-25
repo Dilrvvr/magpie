@@ -44,6 +44,10 @@ import (
 // the version is part of the directory's name, so a cache written by an older
 // one is never read (pruneCalls).
 const callCacheVersion = "calls-v15"
+
+// CallCacheVersion is callCacheVersion, for a cache of what is made of the
+// calls (usage's requests-v1.bin).
+const CallCacheVersion = callCacheVersion
 const maxKeptCalls = 131072
 const maxKeptFiles = 64
 
@@ -55,6 +59,15 @@ var callCounts = map[string]int{} // small allocation hints, never call records
 var callOrder []string
 var callRoot string
 
+// callSwept is when pruneCalls last looked for shards no session file
+// names any more. Every Requests page lists the sources, and reading a
+// folder of ~16k shards and hashing every path each time was a tenth of
+// a warm page (#3493). The shard of a file read here goes as soon as the
+// file does; any other is left for a minute at most.
+var callSwept time.Time
+
+const callSweepEvery = time.Minute
+
 func callCacheDir() string             { return filepath.Join(filepath.Dir(CachePath()), callCacheVersion) }
 func callCachePath(path string) string { return filepath.Join(callCacheDir(), hashHead(path)+".gob") }
 
@@ -65,6 +78,7 @@ func resetCalls() {
 	callContinuations, callContinuationOrder = map[string]callContinuation{}, nil
 	callCounts = map[string]int{}
 	callRoot = ""
+	callSwept = time.Time{}
 	callGeneration++
 	resetOCCalls()
 	// ZCode's listing and WorkBuddy's gateway ids name another HOME's files
@@ -89,10 +103,8 @@ func pruneCalls(files []file) {
 		callCounts = map[string]int{}
 	}
 	on := make(map[string]bool, len(files))
-	shards := make(map[string]bool, len(files))
 	for _, f := range files {
 		on[f.path] = true
-		shards[hashHead(f.path)+".gob"] = true
 	}
 	order := callOrder[:0]
 	for _, path := range callOrder {
@@ -103,9 +115,11 @@ func pruneCalls(files []file) {
 		}
 	}
 	callOrder = order
+	gone := false
 	for path := range callCounts {
 		if !on[path] {
 			delete(callCounts, path)
+			gone = true
 		}
 	}
 	order = callContinuationOrder[:0]
@@ -119,6 +133,11 @@ func pruneCalls(files []file) {
 	callContinuationOrder = order
 
 	trimCallRevisions(time.Now())
+	// a session file read here and gone since takes its shard with it now
+	sweep := moved || gone || time.Since(callSwept) >= callSweepEvery
+	if sweep {
+		callSwept = time.Now()
+	}
 	callsMu.Unlock()
 	if moved {
 		// an older version's shards are never read again
@@ -129,7 +148,14 @@ func pruneCalls(files []file) {
 			}
 		}
 	}
+	if !sweep {
+		return
+	}
 	// IO never holds the metadata lock. A grace period protects live writers.
+	shards := make(map[string]bool, len(files))
+	for _, f := range files {
+		shards[hashHead(f.path)+".gob"] = true
+	}
 	entries, _ := os.ReadDir(root)
 	for _, e := range entries {
 		if e.IsDir() {
@@ -517,7 +543,7 @@ func loadCalls(f file) *callFile {
 			return nil
 		}
 		var frame callFrame
-		if gob.NewDecoder(bytes.NewReader(data)).Decode(&frame) != nil || frame.State.Path != f.path || frame.State.Agent != f.agent {
+		if decodeFrame(data, &frame) != nil || frame.State.Path != f.path || frame.State.Agent != f.agent {
 			return nil
 		}
 		if st != nil && frame.State.Off < st.Off {

@@ -142,6 +142,8 @@ export const FakePlugin = async ({ client }) => ({
       const levels = (l) => Object.fromEntries(l.map((e) => [e, { reasoningEffort: e }]))
       cfg.provider[ID].models["fake-off"] = { name: "Fake Off", reasoning: true, variants: levels(["none", "low", "high", "max"]), limit: { context: 1000, output: 100 } }
       cfg.provider[ID].models["fake-on"] = { name: "Fake On", reasoning: true, variants: levels(["low", "high", "max"]), limit: { context: 1000, output: 100 } }
+      // Trae's levels as Our Free Model's plugin lists them (nianshou5)
+      cfg.provider[ID].models["fake-trae"] = { name: "Fake Trae", reasoning: true, variants: levels(["light", "high", "extra_high"]), limit: { context: 1000, output: 100 } }
     }
     // $FAKE_ZEN: a model as opencode-zen-free 0.1.3's config hook writes
     // it, from models.opencode.ai on 2026-10-11 (#1595, tkhs101): it
@@ -265,13 +267,21 @@ export const FakePlugin = async ({ client }) => ({
     // account's name/uid, so two of one name tell apart), and the
     // answer said by the key: ck-claim gives 50 on a 3-day streak, ck-done
     // is in already, ck-captcha is asked a captcha, ck-throw can't reach
-    // the vendor, ck-odd answers no outcome magpie knows
+    // the vendor, ck-odd answers no outcome magpie knows, and ck-until
+    // answers what the test wrote to <FAKE_CHECKIN>.until ({outcome, until})
     ...(process.env.FAKE_CHECKIN
       ? {
           checkin: async (getAuth) => {
             const a = await getAuth()
             const fs = await import("node:fs")
             fs.appendFileSync(process.env.FAKE_CHECKIN, (a.key ?? (a.uid ? a.accountId + "/" + a.uid : a.accountId) ?? "") + "\n")
+            // $FAKE_CHECKIN_URL: the vendor's check-in, asked at
+            // <url>/<key>; a press it doesn't answer 200 failed (#2777)
+            if (process.env.FAKE_CHECKIN_URL) {
+              const r = await fetch(process.env.FAKE_CHECKIN_URL + "/" + a.key)
+              if (!r.ok) throw new Error(`FakeCo's check-in answered ${r.status}`)
+              return { outcome: "claimed", credit: 1 }
+            }
             switch (a.key) {
               case "ck-claim":
                 return { outcome: "claimed", credit: 50, streak: 3 }
@@ -283,6 +293,8 @@ export const FakePlugin = async ({ client }) => ({
                 throw new Error("FakeCo's check-in is down")
               case "ck-odd":
                 return { outcome: "yes", message: "the daily credits were refreshed" }
+              case "ck-until":
+                return JSON.parse(fs.readFileSync(process.env.FAKE_CHECKIN + ".until", "utf8"))
             }
             return { outcome: "inactive" }
           },

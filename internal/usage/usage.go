@@ -225,6 +225,30 @@ type Record struct {
 	// export with bodies on, #538) and never written to usage.jsonl.
 	BodyIn  string `json:"-"`
 	BodyOut string `json:"-"`
+	// pricedAs is the provider the call is priced as when it is shown
+	// under another: a deleted provider's merged into one on the Usage
+	// page, which costs what it did (provider.Renames.Both). Never kept.
+	pricedAs string
+}
+
+// renameBy has r's provider the one its calls are shown under now
+// (Renames.Of), and keeps the one it is priced as beside it when they
+// differ.
+func (r *Record) renameBy(rn provider.Renames) {
+	shown, own := rn.Both(r.Provider, r.Time)
+	r.Provider, r.pricedAs = shown, ""
+	if own != shown {
+		r.pricedAs = own
+	}
+}
+
+// priceID is the provider r is priced as: its own, not one it is shown
+// under after a merge (renameBy).
+func (r Record) priceID() string {
+	if r.pricedAs != "" {
+		return r.pricedAs
+	}
+	return r.Provider
 }
 
 // Path is the log file: ~/.config/magpie/usage.jsonl (XDG-aware).
@@ -927,6 +951,10 @@ func summarizeFrom(p Period, now time.Time, first time.Time, historicalKeys map[
 		}
 	}
 	historicalKeys = normalizedKeys
+	// the user's clears (cleared.go): a call cleared is in no figure, and a
+	// clear of everything starts the timeline again
+	cleared := readCleared()
+	first = cleared.clearedSince(first)
 	// a picked range's own days alone: its chart can start on the Monday
 	// before its first, and it ends before now (#1492)
 	from, until := p.Since(now), p.Until(now)
@@ -935,7 +963,10 @@ func summarizeFrom(p Period, now time.Time, first time.Time, historicalKeys map[
 			if r.Time.Before(from) || after(until, r.Time) {
 				return
 			}
-			r.Provider = renamed.Of(r.Provider, r.Time)
+			r.renameBy(renamed)
+			if cleared.hides(&r) {
+				return
+			}
 			fn(r)
 		})
 	}

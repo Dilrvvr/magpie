@@ -44,7 +44,7 @@ function routingPage(part) {
   const box = $("#rt");
   if (!box) return;
   const NS = "http://www.w3.org/2000/svg";
-  const still = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const still = calm;
   const shown = () => !$("#view-routing").hidden && !document.hidden;
   // steady redraws a part of the page where the reader is: WebKit has no
   // scroll anchoring, and a part emptied and filled again, measured between,
@@ -495,7 +495,17 @@ function routingPage(part) {
   // a prepaid wallet tells what it has left in its unit, no share (#3950):
   // "6,291 points left", whichever way the meters read
   const balText = (w) => (countFormat.format(w.balance) + " " + t(w.unit || "")).trim();
-  const quota = (w, used, left, vars) => w.balance != null ? t(left, { n: balText(w), ...vars })
+  // and what of it is lost first, as the Usage card says it from the
+  // wallet's window (runsOutText): "6,291 points left · 185 points expire
+  // 23:59", the day's batch otherwise unseen beside the total (#3964).
+  // Live only, as winsOf: a kept day's figure was read long ago
+  const lapses = (w) => {
+    const ws = day ? [] : (cardOf(w)?.windows || []).filter((x) => x.balance != null && (x.unit || "") === (w.unit || ""));
+    const x = ws.find((x) => x.balance === w.balance) || (ws.length === 1 ? ws[0] : null);
+    const out = x ? runsOutText(x) : "";
+    return out ? " · " + out : "";
+  };
+  const quota = (w, used, left, vars) => w.balance != null ? t(left, { n: balText(w), ...vars }) + lapses(w)
     : (w.limit > 0 ? quotaCount(w) + " · " : "") + t(quotaLeft ? left : used, { n: pct(share(w)), ...vars });
   const fill = (w) => Math.max(0, Math.min(100, share(w))) + "%";
   const FAIL = { rate: "rate limited", credit: "out of credit", quota: "quota used up", other: "failed", auth: "sign-in required", canceled: "canceled", foreign: "another account's reasoning", floor: "reply too short", verify: "needs verification", refused: "refused (safety filter)", shape: "request not understood", proxy: "proxy not reachable", effort: "reasoning effort not in its plan", overflow: "too long for its model", room: "reply asked past the window left", slow: "slow to start", prompt: "agent's prompt turned away", restricted: "account restricted by the vendor" };
@@ -4767,13 +4777,17 @@ function routingPage(part) {
   }
   // a member may be a model at an effort of its own, "provider/model:low" —
   // unless the whole is a model's own id (a :free, a :7b); see
-  // provider.MemberEffort
+  // provider.MemberEffort. Several levels joined by "+" ("…:low+high",
+  // Garydesu on X) are those the agent picks among (provider.MemberLevels),
+  // kept each once, lowest first
   const LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]; // provider.MemberEfforts
   function splitMember(id) {
     id = id || "";
     if (id.startsWith("group/") || groups?.models.some((m) => m.id === id)) return [id, ""];
-    const m = /^(.+):(none|minimal|low|medium|high|xhigh|max)$/i.exec(id);
-    return m ? [m[1], m[2].toLowerCase()] : [id, ""];
+    const m = /^(.+):((?:none|minimal|low|medium|high|xhigh|max)(?:\+(?:none|minimal|low|medium|high|xhigh|max))*)$/i.exec(id);
+    if (!m) return [id, ""];
+    const parts = m[2].toLowerCase().split("+");
+    return [m[1], LEVELS.filter((v) => parts.includes(v)).join("+")];
   }
   // a decision model (Jev) is a member of a group of decision models only,
   // asked at /v1/systemone (provider/decide_group.go): it is in
@@ -4821,7 +4835,7 @@ function routingPage(part) {
   // patterns matched when it was read — they are found again each time
   const namedOf = (g) => (g.members || []).filter((x) => !(g.matched || []).includes(x));
   const fixedOf = (id) => subOf(id) ? "" : splitMember(id)[1];
-  const fixedWords = (level) => t("{level} reasoning", { level });
+  const fixedWords = (level) => t("{level} reasoning", { level: level.split("+").join(" / ") });
   // a routing group among a group's members: group/<id>
   const subOf = (id) => id?.startsWith("group/") ? groups?.groups.find((x) => "group/" + x.id === id && !x.hidden) : null;
   // a group's editor, its draft being the group as it is now. The group's own
@@ -5688,6 +5702,14 @@ function routingPage(part) {
     const list = el("div", "fbl");
     const addBtn = el("button", "rt-gadd");
     addBtn.append(svg(PLUS, 11, 1.8), el("span", "", t("Add a model")));
+    // By weight, the named members put heaviest first once (Norcleeh on
+    // Discord): the order is the fallback's, so it is written, not a mode.
+    // Shown only while it would move something; equal weights keep theirs
+    const sortBtn = el("button", "text rt-wsort", t("Sort by weight"));
+    sortBtn.type = "button";
+    sortBtn.title = t("Heaviest first. When a model fails, the next one in this order takes over");
+    const byWeight = () => d.members.slice(0, named()).map((id, i) => [id, i]).sort(([a, i], [b, j]) => Math.max(d.weights[b] || 0, 1) - Math.max(d.weights[a] || 0, 1) || i - j).map(([id]) => id);
+    sortBtn.onclick = () => { d.members.splice(0, named(), ...byWeight()); draw(); };
     // moveMember puts the member at `from` at `to` among those named — a
     // pattern's follow them, in the catalog's order — and keeps the
     // keyboard on its handle when it was there
@@ -5804,25 +5826,48 @@ function routingPage(part) {
         // a decision model reasons at no level of the group's or its own
         if (!s && !deciderOf(id)) {
           const [base, fixed] = splitMember(id);
+          const several = fixed.includes("+");
           const fx = el("button", "rt-cond rt-fixed" + (fixed ? " on" : ""), fixed ? fixedWords(fixed) : t("Group's reasoning"));
-          fx.title = fixed ? t("Sent at {level} reasoning whatever the agent asks, at the model's nearest level", { level: fixed }) : t("Reasons as the group's effort says");
+          fx.title = several ? t("The agent picks among {levels} reasoning, each sent at the model's nearest level", { levels: fixed.split("+").join(" / ") })
+            : fixed ? t("Sent at {level} reasoning whatever the agent asks, at the model's nearest level", { level: fixed }) : t("Reasons as the group's effort says");
           const levels = m?.efforts?.length ? m.efforts.filter((v) => LEVELS.includes(v)) : LEVELS.filter((v) => v !== "none" && v !== "minimal");
+          // the member under another id: its rules, fast, off, weight and
+          // pick go with it
+          const moveTo = (to) => {
+            const from = d.members[i];
+            if (to === from) return true;
+            if (d.members.includes(to)) { status(t("{name} at that reasoning is in the group already", { name: memberName(from) }), "err"); return false; }
+            d.members[i] = to;
+            d.matched = d.matched.filter((x) => x !== from); // named now, at its own reasoning
+            for (const r of d.rules) setUses(r, rUses(r).map((x) => x === from ? to : x));
+            d.fast = d.fast.map((x) => x === from ? to : x);
+            d.off = d.off.map((x) => x === from ? to : x);
+            if (d.weights[from]) { d.weights[to] = d.weights[from]; delete d.weights[from]; }
+            if (d.pick === from) d.pick = to;
+            return true;
+          };
+          // several levels the agent picks among (provider.MemberLevels): a
+          // menu that stays open, each level ticked or not; one left is a
+          // fixed effort again, none follows the group
+          const pickSeveral = (ev) => {
+            let have = fixed ? fixed.split("+") : [];
+            openPicker({ id: "", name: "", fields: [] }, { key: "rule", label: "reasoning", value: "", menu: true, multi: true,
+              options: levels.map((v) => ({ value: v, label: v })), picked: (v) => have.includes(v), onPick: (v) => {
+                const next = have.includes(v) ? have.filter((x) => x !== v) : LEVELS.filter((x) => x === v || have.includes(x));
+                const at = next.join("+");
+                if (!moveTo(at ? `${base}:${at}` : base)) return;
+                have = next;
+                draw(); drawRules();
+              } }, fx, ev);
+          };
           fx.onclick = (ev) => pickFrom("reasoning", fx, ev, [
             { value: "", label: t("Follow the group"), note: t("as the group's effort says") },
             ...levels.map((v) => ({ value: v, label: fixedWords(v), note: t("whatever the agent asks") })),
+            ...(levels.length > 1 ? [{ value: "+", label: t("Several levels…"), note: t("the agent picks among them") }] : []),
           ], (v) => {
-            const to = v ? `${base}:${v}` : base;
-            if (to === id) return;
-            if (d.members.includes(to)) { status(t("{name} at that reasoning is in the group already", { name: memberName(id) }), "err"); return; }
-            d.members[i] = to;
-            d.matched = d.matched.filter((x) => x !== id); // named now, at its own reasoning
-            for (const r of d.rules) setUses(r, rUses(r).map((x) => x === id ? to : x));
-            d.fast = d.fast.map((x) => x === id ? to : x);
-            d.off = d.off.map((x) => x === id ? to : x);
-            if (d.weights[id]) { d.weights[to] = d.weights[id]; delete d.weights[id]; }
-            if (d.pick === id) d.pick = to;
-            draw(); drawRules();
-          }, fixed);
+            if (v === "+") { pickSeveral(ev); return; }
+            if (moveTo(v ? `${base}:${v}` : base)) { draw(); drawRules(); }
+          }, several ? "+" : fixed);
           row.append(fx);
           // its vendor's fast mode, where the model has one: priority
           // processing, Claude's fast mode (provider.CanFast)
@@ -5877,6 +5922,7 @@ function routingPage(part) {
         list.append(row);
       });
       addBtn.querySelector("span").textContent = t(d.members.length ? "Add another model" : "Add a model");
+      sortBtn.hidden = d.routing !== "weight" || byWeight().every((id, i) => d.members[i] === id);
     };
     // the picker stays open for as many models as are wanted, each ticked
     // once in, and says which other groups a model is in already (PAMI on
@@ -5911,7 +5957,9 @@ function routingPage(part) {
         draw(); drawRules();
       } }, addBtn, ev);
     };
-    box.append(list, addBtn);
+    const adds = el("div", "rt-madds");
+    adds.append(addBtn, sortBtn);
+    box.append(list, adds);
     draw();
     const mw = el("div");
     mw.append(box, el("div", "hint", t("The first answers for what the model can do. In order, they are tried top first.")));
@@ -6048,7 +6096,8 @@ function routingPage(part) {
     ctxIn.setAttribute("aria-label", t("Context"));
     ctxHint.id = "groupContextHint";
     ctxIn.setAttribute("aria-describedby", ctxHint.id);
-    const ctxs = () => d.members.map((id) => groups.models.find((x) => x.id === id)?.context || infoOf(id)?.context || 0).filter((n) => n > 0);
+    const ctxOf = (id) => groups.models.find((x) => x.id === id)?.context || infoOf(id)?.context || 0;
+    const ctxs = () => d.members.map(ctxOf).filter((n) => n > 0);
     const ctxMode = () => d.context === -1 ? "smallest" : d.context > 0 ? "custom" : "largest";
     let ctxErr = "";
     const drawCtx = () => {
@@ -6060,6 +6109,10 @@ function routingPage(part) {
         ? t("Agents are told the group takes {n} tokens; a longer conversation still goes on to a member with room for it.", { n: (d.context || 0).toLocaleString(intlLang()) })
         : mode === "smallest"
           ? (small ? t("Agents are told {n} tokens, its smallest model's, so they compact before any member would turn the conversation away.", { n: small.toLocaleString(intlLang()) }) : t("Agents are told its smallest model's window, so they compact before any member would turn the conversation away."))
+          // members whose windows differ (windy on Discord: a 1M group
+          // with a 128K member) are named with the length that skips them,
+          // by provider too, as one model's members differ by it alone
+          : small && small < big ? t("Agents are told {n} tokens, its largest model's; a conversation longer than {m} skips {who} for a member with room for it.", { n: big.toLocaleString(intlLang()), m: small.toLocaleString(intlLang()), who: d.members.filter((id) => ctxOf(id) === small).map((id) => memberLabel(g || {}, id)).join(", ") })
           : (big ? t("Agents are told {n} tokens, its largest model's; a conversation too long for one member goes on to one with room for it.", { n: big.toLocaleString(intlLang()) }) : t("Agents are told its largest model's window; a conversation too long for one member goes on to one with room for it.")));
     };
     const CTX_OPTS = [["largest", "Largest model's"], ["smallest", "Smallest model's"], ["custom", "Custom"]];
@@ -6203,9 +6256,30 @@ function routingPage(part) {
       };
       return b;
     };
+    // fitConds: the widest rule's conditions, measured, as every rule's
+    // (--rt-condw), so each rule's → starts at one x. Measured each under
+    // its own fit-content(50%), with the width before taken off; told a
+    // frame after a rule's conditions or the list change size, or a
+    // condition is typed into (narrower, a rule held at the width before
+    // tells nothing)
+    let condsSoon = 0;
+    const fitConds = () => {
+      condsSoon = 0;
+      if (!rlist.offsetWidth) return;
+      rlist.style.removeProperty("--rt-condw");
+      const w = Math.max(0, ...[...rlist.querySelectorAll(":scope > .rt-rule > .rt-line.when")].map((x) => x.getBoundingClientRect().width));
+      // up to the layout's 1/64px, so the widest rule's conditions don't wrap
+      if (w) rlist.style.setProperty("--rt-condw", Math.ceil(w * 64) / 64 + "px");
+    };
+    const fitCondsSoon = () => { if (!condsSoon) condsSoon = requestAnimationFrame(fitConds); };
+    const condsSeen = new ResizeObserver(fitCondsSoon);
+    rlist.addEventListener("input", fitCondsSoon);
     const drawRules = () => {
       drawCtx(); // the members' windows changed with them
       rlist.replaceChildren();
+      // the rules drawn before are let go, not watched on while unseen
+      condsSeen.disconnect();
+      condsSeen.observe(rlist);
       rAdd.hidden = rTip.hidden = d.members.length < 2;
       // only what holds the rules back is said in a line: how they work is
       // under the ⓘ beside Add a rule
@@ -6562,7 +6636,9 @@ function routingPage(part) {
         };
         row.append(ruleHandle(i, row), line, then, more, need);
         rlist.append(row);
+        condsSeen.observe(line);
       });
+      fitConds();
       drawClassifier();
       focusCond = null;
       focus?.();

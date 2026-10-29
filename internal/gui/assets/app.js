@@ -126,6 +126,7 @@ async function api(path, body, heads, signal) {
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
+  if (body === undefined) await skelHold();
   heads?.(res.headers);
   if (had && res.ok && res.headers.get("X-Magpie-Same")) return had.data;
   if (res.status === 204) return null;
@@ -380,11 +381,17 @@ function status(msg, kind = "", ms = kind === "err" ? 8000 : 3500) {
   s.title = msg;
   s.className = "status " + kind;
   s.setAttribute("role", kind === "err" ? "alert" : "status");
-  // with a dialog open the footer is under its scrim: the pill floats over both
+  // with a dialog open the footer is under its scrim, and a line longer than
+  // the footer is cut there (littleHong): the pill floats over both, wrapped
   const m = $("#modal");
-  s.classList.toggle("lift", !!msg && !m.hidden && !m.classList.contains("out"));
+  s.classList.toggle("lift", !!msg && (!m.hidden && !m.classList.contains("out") || s.scrollWidth > s.clientWidth));
   clearTimeout(status.t);
-  if (msg) status.t = setTimeout(() => { s.textContent = ""; s.className = "status"; }, ms);
+  if (!msg) return;
+  // as long as a long one takes to read, and while the pointer is on it
+  const end = (w) => status.t = setTimeout(() => { s.textContent = ""; s.className = "status"; }, w);
+  s.onmouseenter = () => clearTimeout(status.t);
+  s.onmouseleave = () => end(2000);
+  end(Math.max(ms, msg.length * 80));
 }
 
 // ---------- agents view ----------
@@ -1357,7 +1364,7 @@ function connectLine(a, kind) {
     else say(t("Not added · {agent} asks to add magpie when its link opens", { agent: a.name }));
     return line;
   }
-  if (kind === "empty") { say(t("Add a key or a subscription first; then there are models to connect")); return line; }
+  if (kind === "empty" && !switchable(a)) { say(t("Add a key or a subscription first; then there are models to connect")); return line; }
   if (!a.wired && a.native && a.native.provider !== "disconnected") {
     say(t(a.native.detail), "bad");
     if (a.native.provider === "invalid") line.append(driftFix(a, "Reconnect"));
@@ -1365,24 +1372,22 @@ function connectLine(a, kind) {
   }
   if (!a.wired) {
     const src = a.source || "";
+    const sw = switchEntry(a);
     if (kindOf(a) === "agy") say(t("Not connected · once connected, start it with magpie's command"));
     // not connected, yet through magpie for account failover (#1385): it
     // read as Codex on its own while magpie served every request, so the
-    // line says why, and the accounts that turn it off are a click away
+    // line says why, and its account switch (below) turns it off
     else if (a.failover) {
       say(t("Not connected · goes through magpie only to fail over to your other ChatGPT accounts"));
       words.title = t("magpie set openai_base_url in {agent}'s config.toml, so a request the ChatGPT account {agent} is signed in to has no allowance for goes on to your other ChatGPT accounts on in magpie. {agent} keeps to its own models. To stop it, tick Only switch {agent}'s sign-in under Providers › Codex, or switch those accounts off; connecting {agent} adds magpie's models.", { agent: a.name });
-      const go = el("button", "ag-acc", t("ChatGPT accounts"));
-      go.type = "button";
-      go.title = words.title;
-      go.onclick = (e) => { e.stopPropagation(); openProvider("codex"); };
-      line.append(go);
     }
+    else if (sw?.p.switchOnly) say(t("Not connected · switching accounts only"));
     else if (src === "sub") say(t("Not connected · now on its Claude subscription"));
     else if (src === "chatgpt") say(t("Not connected · now signed in with ChatGPT · OpenAI's models stay available once connected"));
     else if (src === "key") say(t("Not connected · now on an API key of its own"));
     else if (src.startsWith("providers:")) say(t("Not connected · now has {n} providers of its own", { n: src.slice(10) }));
     else say(t("Not connected · {agent} uses its own settings", { agent: a.name }));
+    if (sw) line.append(sw.button);
     if (a.appRestart) line.append(appRestart(a));
     return line;
   }
@@ -1577,6 +1582,63 @@ function connectRow(a, row, who, { fields, extras, fieldBtn, sw, kind }) {
     row.classList.add("expanded");
     row.append(connectPanel(a, { fields: fields.querySelector(".field") ? fields : null, extras, fieldBtn }));
   }
+}
+
+// Switch accounts only (the owner on X): a Claude Code or Codex not
+// connected says its account, and its menu signs it in to another, as the
+// account rows do; the window's, the panel reads no provider list
+let accountSwitched = null;
+
+function switchable(a) {
+  if (a.wired || mode === "panel" || (a.id !== "claude" && a.id !== "codex")) return null;
+  const p = (providers || providersEarly?.got)?.providers?.find((x) => x.id === a.id && x.account?.agent === a.id);
+  return p && loginsInOrder(p.account, p)[0]?.user ? p : null;
+}
+
+function switchEntry(a) {
+  const p = switchable(a);
+  if (!p) return null;
+  const ls = loginsInOrder(p.account, p), cur = ls.find((l) => l.active)?.user || "", ag = { agent: a.name };
+  const b = el("button", "ag-acc ag-who"), cx = a.id === "codex";
+  b.type = "button";
+  b.setAttribute("aria-haspopup", "menu");
+  b.setAttribute("aria-expanded", "false");
+  if (cur) b.title = t("Switch accounts only: {agent} is signed in as {user}. Pick another of its accounts to sign {agent} in to it, without connecting it to magpie.", { ...ag, user: cur });
+  b.append(svg(EXTRA_GLYPH["sign-in"], 12, 1.5), el("span", "v", cur || t("Not signed in")));
+  const ago = performance.now() - (accountSwitched?.at || -1e9);
+  if (accountSwitched?.agent === a.id && accountSwitched.user === cur && ago < 5000) {
+    const ok = el("span", "ok");
+    ok.append(svg(CHECK, 10, 2.2), el("span", "", t("Switched")));
+    b.append(ok);
+    b.classList.add("done");
+    setTimeout(() => b.classList.remove("done"), 5000 - ago);
+  }
+  b.append(svg(CHEV, 10, 1.6));
+  const opts = ls.map((l) => ({ v: "u:" + l.user, name: l.user, literalName: true, note: l.lapsed ? "Sign-in required" : accountPlan({ agent: a.id, plan: l.plan }) }));
+  const on = cx ? t("magpie only switches {agent}'s sign-in; its requests go straight to OpenAI", ag) : t("magpie serves no requests on these accounts");
+  // the Only switch setting, where the accounts page offers it
+  if (!cx || ls.filter((l) => !l.lapsed && (l.active || l.on)).length > 1) opts.push({ v: "only", name: t("Only switch {agent}'s sign-in", ag), literalName: true, ticked: !!p.switchOnly, note: on });
+  opts.push({ v: "manage", name: "Manage accounts…", note: "" });
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (b.classList.contains("open")) return closeProtoMenu();
+    openProtoMenu(b, opts, "u:" + cur, (v) => {
+      const l = ls.find((x) => "u:" + x.user === v);
+      if (v === "only") accountAction("provider/switchonly", { id: p.id, switchOnly: !p.switchOnly }, !p.switchOnly ? on
+        : cx ? t("{agent}'s requests go through magpie to fail over to your other accounts again", ag) : t("magpie serves requests on these accounts again"));
+      else if (v === "manage" || l?.lapsed) openProvider(a.id);
+      else if (l && l.user !== cur) switchAccountTo(a, p, l.user);
+    }, "Switch accounts only", "sess-menu", "right");
+  };
+  return { p, button: b };
+}
+
+async function switchAccountTo(a, p, user) {
+  const said = t("{agent} is now signed in as {user}. New {agent} sessions use this account; one already open keeps its account until it is started again.", { agent: a.name, user });
+  // kept signed in to one of the user's choosing (#524): that choice moves
+  if (!await (keptLogin(p) ? accountAction("provider/keeplogin", { id: p.id, keepLogin: true, keepLoginAs: user }, said) : accountAction("login/switch", { agent: a.id, user }, said))) return;
+  accountSwitched = { agent: a.id, user, at: performance.now() };
+  renderAgents();
 }
 
 // agentsLead: above the window's list, what 「接入」 does, said once in a
@@ -6002,7 +6064,11 @@ let providersEarly = null;
 function prefetchProviders() {
   if (providers || providersEarly) return;
   const e = providersEarly = { read: api("providers") };
-  e.read.then((s) => { e.got = s; markNewPartners(); }, () => { if (providersEarly === e) providersEarly = null; });
+  e.read.then((s) => {
+    e.got = s;
+    markNewPartners();
+    if (state?.agents?.some((a) => !a.wired && (a.id === "claude" || a.id === "codex"))) renderAgents();
+  }, () => { if (providersEarly === e) providersEarly = null; });
 }
 
 // The page's first reading, while it is on its way, is the one every ask
@@ -7540,7 +7606,7 @@ function partnerTile(pr) {
 
 let fieldIDs = 0;
 function field(label, control, hint) {
-  const l = el("label", "", label);
+  const l = el("label", control.classList?.contains("accts") ? "by-list" : "", label); // on a list's first row
   const wrap = el("div");
   wrap.append(control);
   const inputSelector = "input, select, textarea";
@@ -8501,6 +8567,14 @@ function skelSeen() {
 // left, and with the bird turned off neither runs (a 1-core server:
 // Yayoi_no_yume on X).
 let skelSince = 0, skelFlying = false, skelTick = 0;
+// Once come, the bird lands three times (~1.6s) before a read goes in (the
+// owner, 10-30). At most 3s: a hidden window draws no frames.
+let skelGate = null, skelWaiting = 0;
+async function skelHold() {
+  if (!skelGate) return;
+  skelWaiting++;
+  try { await skelGate; } finally { skelWaiting--; }
+}
 const skelAdded = new MutationObserver((recs) => {
   for (const r of recs) for (const n of r.addedNodes) if (n.nodeType === 1 && (n.matches(SKEL) || n.querySelector(SKEL))) return skelWatch();
 });
@@ -8523,6 +8597,9 @@ function skelWatch() {
 skelWatch();
 async function skelBird() {
   skelFlying = true;
+  let release;
+  const gate = skelGate = new Promise((ok) => { release = () => { if (skelGate === gate) skelGate = null; ok(); }; });
+  setTimeout(release, 3000);
   const b = el("div", "sk-bird roam");
   b.innerHTML = BIRD;
   document.body.append(b);
@@ -8543,17 +8620,27 @@ async function skelBird() {
     const after = seen.filter((t) => s.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING);
     return after[0] || seen[0];
   };
-  let s = next(null);
-  if (!s) return void (b.remove(), (skelFlying = false));
+  let s = next(null), quiet = false;
+  if (!s) return void (b.remove(), release(), (skelFlying = false));
   try {
     let at = spot(s);
     put({ x: at.x - 24, y: at.y - 40, f: 1 });
+    b.animate([{ opacity: 0 }, { opacity: 1 }], 120);
     await tween(300, (e, t) => put({ x: at.x - 24 + 24 * t, y: at.y - 40 + 40 * e, sx: 1 - .05 * t, sy: 1 + .08 * t }), easeIn);
+    // its bar gone mid-drop: it fades, never flying over the content
+    if (!s.isConnected) return void (quiet = true);
     for (let hops = 0; hops < 400; hops++) {
       // it lands: the bar dips under it and springs back
       s.animate([{ transform: "none" }, { transform: "translateY(3px)", offset: .3 }, { transform: "translateY(-1.2px)", offset: .6 }, { transform: "translateY(.4px)", offset: .8 }, { transform: "none" }], { duration: 560, easing: "ease-out" });
       await tween(130, (e) => put({ y: at.y + 3 * e, sx: 1 + .14 * e, sy: 1 - .18 * e }), easeOut);
       await tween(90, (e) => put({ y: at.y + 3 * (1 - e), sx: 1.14 - .14 * e, sy: .82 + .18 * e }), easeIn);
+      // third landing: held reads go in; it stands while the page fills,
+      // and leaves only when no bar is left
+      if (hops === 2) {
+        const held = skelWaiting;
+        release();
+        if (held) await new Promise((ok) => setTimeout(ok, 160));
+      }
       const to = birdOff() ? null : next(s);
       if (!to) break;
       const from = { x, y }, go = spot(to), h = 16 + Math.min(40, Math.hypot(go.x - from.x, go.y - from.y) * .15);
@@ -8566,10 +8653,12 @@ async function skelBird() {
       s = to; at = { x, y };
     }
   } finally {
+    release();
     // nothing left to stand on: it flies off, up and away
+    if (quiet) await b.animate([{ opacity: 1 }, { opacity: 0, transform: b.style.transform + " scale(.6)" }], { duration: 160, easing: "ease-in", fill: "forwards" }).finished;
     b.dataset.flap = "";
     const from = { x, y };
-    await tween(480, (e) => put({ x: from.x + (innerWidth + 60 - from.x) * e, y: from.y - (from.y + 80) * e, f: 1, r: -14, sx: 1, sy: 1 }), easeIn);
+    if (!quiet) await tween(480, (e) => put({ x: from.x + (innerWidth + 60 - from.x) * e, y: from.y - (from.y + 80) * e, f: 1, r: -14, sx: 1, sy: 1 }), easeIn);
     b.remove();
     skelFlying = false;
     skelSince = 0;
@@ -12266,6 +12355,7 @@ let signing = null; // the sign-in under way: { id, agent, url, state, installin
 const stopSignIn = () => { if (signing?.id) api("signin/" + signing.id + "/cancel", {}).catch(() => {}); };
 const signingOpen = () => signing?.state === "waiting" || signing?.state === "installing";
 let justAdded = ""; // the account that just came in, to greet it
+const accountToolsOpen = new Set(); // rows whose ⋯ is open
 
 // o: { user } signing that account in again, { proxy } the one picked to
 // sign in through (#1663): none picked, the one the account's requests go
@@ -13179,10 +13269,16 @@ function renderAccounts(a, p) {
       dot.title = on ? t("Stop using this account") : t("Use this account too");
       dot.onclick = () => accountAction("login/" + (on ? "off" : "on"), { agent: a.agent, user: l.user });
     }
-    row.append(dot, accountNameButton(p, l.user), el("span", "plan", accountPlan({ agent: a.agent, builtin: a.builtin, plan: l.plan })));
+    // one line, First or Make first at its right end (the owner, 10-29)
+    const line = el("div", "acc-line");
+    row.append(line);
+    line.append(dot, accountNameButton(p, l.user), el("span", "plan", accountPlan({ agent: a.agent, builtin: a.builtin, plan: l.plan })));
     // its own models (#474), when there is another account to send the rest to
     const [amPill, amBox] = ls.length > 1 || accountModelsOf(p, l.user).length ? accountModels(p, l.user, false, l.user) : [];
-    if (amPill) row.append(amPill);
+    // what is set shows on it; the rest waits under ⋯ on a line below
+    const tools = el("div", "acc-tools");
+    const pill = (x) => (x.classList.contains("set") ? line : tools).append(x);
+    if (amPill) pill(amPill);
     // its usage cap: the share of each window it is used to at most
     const cap = accountCapOf(p, l.user);
     // Claude Code or Codex signed in to it asks its vendor itself, not
@@ -13190,76 +13286,90 @@ function renderAccounts(a, p) {
     // holds back only what goes through magpie (𝕏 on Discord: a 90% cap
     // and the five hours run to 100%)
     const direct = l.active && !several && (a.agent === "claude" || a.agent === "codex") ? a.agentName : "";
-    if (p) row.append(accountCapPill(p, l.user, cap, direct));
+    if (p) pill(accountCapPill(p, l.user, cap, direct));
     // and each window's own, set on its meter (willz on Discord)
     const capFor = (w) => windowCapOf(p, l.user, w);
     // how many requests it has out at once, and waiting (#892)
-    if (p) row.append(laneLimitPill(p, l.user, p.id + "@" + String(l.user).toLowerCase(), l.user));
+    if (p) pill(laneLimitPill(p, l.user, p.id + "@" + String(l.user).toLowerCase(), l.user));
     const held = capHeldOf(quota?.[l.user], capFor);
-    if (held) row.append(capHeldNote(held, held.cap, several, direct));
-    row.append(el("span", "grow"));
+    if (held) line.append(capHeldNote(held, held.cap, several, direct));
+    line.append(el("span", "grow"));
     if (unusable(l)) {
       row.classList.add("signed-out");
-      row.append(el("span", "using", t("Sign-in required")));
+      line.append(el("span", "using", t("Sign-in required")));
       const again = el("button", "text", t("Sign in again"));
       again.onclick = () => startSignIn(a.agent, false, undefined, { user: l.user });
-      row.append(again);
+      line.append(again);
       // the one Claude Code is signed in to can't be forgotten (ForgetLogin)
       if (!l.active) {
-        row.append(forgetOf());
+        line.append(forgetOf());
       }
     } else if (signedOut(l)) {
       row.classList.add("signed-out");
-      row.append(el("span", "using", t("Sign-in required")));
+      line.append(el("span", "using", t("Sign-in required")));
       const again = el("button", "text", t("Sign in again"));
       again.onclick = () => startSignIn(a.agent, false, againSite(l), { user: l.user });
-      row.append(again, forgetOf(true));
+      line.append(again, forgetOf(true));
     } else if (l.active && kept && l.user !== firstUser) {
       // signed in to, kept so, and tried at its place in the order
       const signed = el("span", "using", l.paused ? t("Paused") : t("Signed in"));
       signed.title = t("{agent} is kept signed in to this account; requests through magpie go to the accounts in their order", { agent: a.agentName });
-      row.append(signed);
-      if (on) row.append(makeFirst(l));
+      line.append(signed);
+      if (on) line.append(makeFirst(l));
     } else if (l.active) {
       const using = el("span", "using", l.paused ? t("Paused") : back ? t("First for now") : several ? t("First") : t("In use"));
       if (back && !l.paused) using.title = t("{user} was nearly used up, so magpie signed {agent} in to this one; it goes back to {user} once that has room again", { user: back.user, agent: a.agentName });
-      row.append(using);
+      line.append(using);
       if (a.agent === "qoder" || a.agent === "qoder-cn" || l.own) {
-        row.append(forgetOf(l.own));
+        line.append(forgetOf(l.own));
       } else if (a.agent === "codex" && ls.length === 1) {
         // Codex's only account: no other to sign it in to first, so it is
         // signed out, as codex logout does (ForgetLogin)
         const out = el("button", "text quiet", t("Sign out"));
         out.title = t("Signs Codex out of this account, as codex logout does");
         out.onclick = () => askSignOutLogin(a, l);
-        row.append(out);
+        line.append(out);
       } else if (a.agent === "codex") {
         // Codex is signed in to another of its accounts first, then this
         // one goes (ForgetLogin), rather than Codex signed out
-        row.append(forgetOf(t("Codex is signed in to another of its accounts, and magpie forgets this one; the account itself is untouched")));
+        line.append(forgetOf(t("Codex is signed in to another of its accounts, and magpie forgets this one; the account itself is untouched")));
       }
     } else {
       const forget = forgetOf(true);
       if (l === back) {
         const again = el("span", "using", t("First again once it has room"));
         again.title = t("magpie signs {agent} back in to this account once it has room again", { agent: a.agentName });
-        row.append(again);
+        line.append(again);
       }
       if (kept) {
         // the sign-in stays where it is kept: Make first is the order's,
         // and an account not in use is ticked on by its dot
-        row.append(forget);
-        if (l.user === firstUser) row.append(el("span", "using", t("First")));
-        else if (on) row.append(makeFirst(l));
+        line.append(forget);
+        if (l.user === firstUser) line.append(el("span", "using", t("First")));
+        else if (on) line.append(makeFirst(l));
       } else {
         const use = el("button", "text", on ? t("Make first") : t("Use"));
         use.title = sub?.own ? t("The gateway uses this account first") : t("Sign {agent} in to this account", { agent: a.agentName });
         use.onclick = () => { use.classList.add("busy"); accountAction("login/switch", { agent: a.agent, user: l.user }, sub?.own ? t("The gateway now uses {user} first", { user: l.user }) : t("{agent} is now signed in as {user}", { agent: a.agentName, user: l.user })); };
-        row.append(forget, use);
+        line.append(forget, use);
       }
     }
     row.append(accountQuota(l.lapsed ? { [l.user]: { error: t(l.lapsed) } } : quota, l.user, capFor, p ? (m, w) => windowCapMeter(m, p, l.user, w) : null));
     row.classList.add("with-aq"); // not :has(.aq), which Safari 15.0 lacks (#220)
+    // Remove goes under ⋯ too, but beside Sign in again while signed out
+    if (!row.classList.contains("signed-out")) tools.append(...line.querySelectorAll(":scope > .text.quiet"));
+    if (tools.childElementCount) {
+      const key = (p?.id || a.agent) + "@" + String(l.user).toLowerCase(), more = el("button", "acc-more");
+      more.type = "button";
+      more.append(svg(DOTS, 14, 2.4));
+      more.title = t("Settings for {user}", { user: l.user });
+      more.setAttribute("aria-label", more.title);
+      const shown = (v) => { row.classList.toggle("tools-open", v); more.setAttribute("aria-expanded", v); v ? accountToolsOpen.add(key) : accountToolsOpen.delete(key); };
+      shown(accountToolsOpen.has(key) || !!amBox);
+      more.onclick = () => shown(!row.classList.contains("tools-open"));
+      line.querySelector(".grow").after(more);
+      row.append(tools);
+    }
     if (amBox) row.append(amBox);
     list.append(row);
   }
@@ -14056,6 +14166,9 @@ function laneText(pill) {
   if (pill.textContent !== text) pill.textContent = text;
   lanesTick ||= setInterval(refreshLanes, 2e3);
   pill.classList.toggle("set", own != null || limit + busy > 0);
+  // set or running on its account's line, else under ⋯, not while open
+  const row = pill.closest(".acc"), tools = row?.querySelector(".acc-tools"), line = row?.querySelector(".acc-line"), on = pill.classList.contains("set");
+  if (tools && line && !pill.classList.contains("open") && pill !== document.activeElement && pill.parentElement === (on ? tools : line)) on ? line.querySelector(".grow").before(pill) : tools.insertBefore(pill, tools.querySelector(".text.quiet"));
   pill.classList.toggle("busy-lane", !!(limit && busy >= limit));
   pill.classList.toggle("queued", !!waiting);
   const whose = own != null ? t("its own") : t("the provider's");
@@ -14940,7 +15053,8 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
   closeProtoMenu();
   const multi = Array.isArray(value);
   let picked = multi ? [...value] : null;
-  const isOn = (v) => !multi ? v === value : v === "" ? !picked.length : picked.includes(v);
+  // an item with its own ticked (true or false) is a setting beside the pick
+  const isOn = (v, o) => typeof o?.ticked === "boolean" ? o.ticked : !multi ? v === value : v === "" ? !picked.length : picked.includes(v);
   const box = el("div", "pop proto-menu" + (cls ? " " + cls : ""));
   box.setAttribute("role", "menu");
   box.append(el("div", "pm-head", t(head)));
@@ -14954,15 +15068,15 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
     box.append(top);
   }
   const tick = (b, o) => {
-    b.classList.toggle("on", isOn(o.v));
-    b.setAttribute("aria-checked", isOn(o.v));
-    b.firstChild.replaceChildren(...(isOn(o.v) ? [svg(CHECK, 12, 1.9)] : []));
+    b.classList.toggle("on", isOn(o.v, o));
+    b.setAttribute("aria-checked", isOn(o.v, o));
+    b.firstChild.replaceChildren(...(isOn(o.v, o) ? [svg(CHECK, 12, 1.9)] : []));
   };
   const items = opts.map((o) => {
     const b = el("button", "pm-item");
     b.type = "button";
     if (o.title) b.title = o.title;
-    b.setAttribute("role", multi && o.v && o.v !== "\x00" ? "menuitemcheckbox" : "menuitemradio");
+    b.setAttribute("role", multi && o.v && o.v !== "\x00" || typeof o.ticked === "boolean" ? "menuitemcheckbox" : "menuitemradio");
     const words = el("span", "pm-words");
     words.append(el("span", "pm-name", o.literalName ? o.name : t(o.name)), el("span", "pm-note", t(o.note)));
     b.append(el("span", "pm-tick"), words);
@@ -19446,6 +19560,8 @@ function setSetTab(tab, remember) {
     $("#setPage-" + id).hidden = !on;
   }
   setShown = tab;
+  // each agent's row is read only where it is shown
+  if (view === "settings" && tab === "privacy" && !setQuery) loadSessionReads();
   $("#setTabs").setAttribute("aria-label", t("Settings"));
   $("#setQ").setAttribute("aria-label", t("Find a setting"));
   if (view === "settings") syncURL();
@@ -19788,6 +19904,7 @@ function renderSettings() {
   renderDisabledModels(s);
   renderRedact(s, keep);
   renderDiscovery(s);
+  renderSessionReads(s);
   renderOTel(s, keep);
   renderPort(s);
   renderBareIds(s);
@@ -19939,40 +20056,6 @@ function renderLangPick(s, keep) {
       if (v === chosen) return;
       savePrefs({ ...keep, lang: v });
     }, "Language", "sess-menu", "right");
-  };
-}
-
-function renderSessionTerminal(s, keep) {
-  const row = $("#sessionTerminalRow");
-  row.hidden = !document.body.classList.contains("mac");
-  if (row.hidden) return;
-  const select = $("#sessionTerminalSelect");
-  const apps = [...(s.terminalApps || [])];
-  if (!apps.some((app) => app.id === "com.apple.Terminal")) apps.unshift({ id: "com.apple.Terminal", name: "Terminal" });
-  const chosen = s.sessionTerminal || "system";
-  // a default that is not a terminal opens Terminal, as the server does
-  const defaultApp = apps.find((app) => app.id === s.terminalDefault) || apps.find((app) => app.id === "com.apple.Terminal");
-  const options = [{ id: "system", name: t("System default ({name})", { name: defaultApp.name }) }];
-  for (const app of apps) {
-    if (app.id === defaultApp.id && app.id !== chosen) continue;
-    options.push({ id: app.id, name: app.id === defaultApp.id ? t("{name} (fixed)", { name: app.name }) : app.name });
-  }
-  if (!options.some((app) => app.id === chosen)) {
-    options.push({ id: chosen, name: t("Unavailable app ({id})", { id: chosen }) });
-  }
-  // the app's own menu, not a native select
-  select.dataset.value = chosen;
-  select.replaceChildren(el("span", "", options.find((app) => app.id === chosen).name), svg(CHEV, 11, 1.6));
-  select.onclick = (e) => {
-    e.stopPropagation();
-    if (select.classList.contains("open")) return closeProtoMenu();
-    openProtoMenu(select, options.map((app) => ({ v: app.id, name: app.name, note: "", literalName: true })), chosen, (v) => {
-      if (v === chosen) return;
-      // drawn at once; the save draws it again with what was kept
-      select.dataset.value = v;
-      select.firstChild.textContent = options.find((app) => app.id === v).name;
-      savePrefs({ ...keep, sessionTerminal: v === "system" ? "" : v });
-    }, "Session terminal", "sess-menu");
   };
 }
 

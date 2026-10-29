@@ -65,11 +65,31 @@ magpie.plugin("library", (ctx) => {
   // One gone from this computer (gone: uninstalled, or its CLI) is listed
   // only on the rows of what it still has (withGone), for that to be taken
   // out: an agent that isn't installed was on every row (@jiahao_jayden).
-  const shownAgents = () => lib.agents.filter((a) => !a.gone && !isHidden(a));
-  const withGone = (all, on) => [...all, ...lib.agents.filter((a) => a.gone && (on || []).includes(a.id) && !all.some((x) => x.id === a.id))];
+  // An agent in a stopped WSL distro (asleep) is listed by what magpie last
+  // knew of it, its ticks kept for when the distro next runs; one whose
+  // places magpie never saw (unseen) only on the rows that name it, like
+  // a gone one, its chip greyed out: opening its files would start WSL
+  // (#3896, cybercaius on Discord).
+  const shownAgents = () => lib.agents.filter((a) => !a.gone && !a.unseen && !isHidden(a));
+  const withGone = (all, on) => [...all, ...lib.agents.filter((a) => (a.gone || a.unseen && !isHidden(a)) && (on || []).includes(a.id) && !all.some((x) => x.id === a.id))];
   const mcpAgents = () => shownAgents().filter((a) => a.mcp)
     .map((a) => a.mcpVia ? { ...a, aside: t("{agent} reads MCP servers through the {ext} extension", { agent: a.name, ext: a.mcpVia }) } : a);
   const skillAgents = () => shownAgents().filter((a) => a.skills);
+  // the MCP hub's agents: not a stopped distro's, whose files say what it
+  // has of the hub, and can't be read without starting it
+  const hubAgents = () => mcpAgents().filter((a) => !a.asleep);
+  // one line for each stopped WSL distro the page lists agents of: they
+  // show what magpie last saw, and a change waits for the distro to run
+  function asleepAsides() {
+    const seen = lib.agents.filter((a) => a.asleep && !isHidden(a));
+    return [...new Set(seen.map((a) => a.asleep))].map((d) => {
+      const unseen = seen.filter((a) => a.asleep === d && a.unseen).map((a) => a.name);
+      const p = el("p", "lib-aside lib-asleep", t("WSL {distro} isn't running: its agents show what magpie last saw there, and what you change is written there the next time it runs.", { distro: d }));
+      if (unseen.length) p.append(" " + t("{agents} can be changed once it runs.", { agents: unseen.join(", ") }));
+      p.dataset.distro = d;
+      return p;
+    });
+  }
 
   function glyph(d, cls = "lib-glyph") {
     const g = el("span", cls);
@@ -266,6 +286,12 @@ magpie.plugin("library", (ctx) => {
       // grey chip for a remote server and nothing said why
       if (blocked) { c.classList.add("blocked"); c.setAttribute("aria-disabled", "true"); tip = blocked; }
       if (a.gone) { c.classList.add("gone"); tip = t("{agent} isn't installed here — click to take it away", { agent: a.name }); }
+      if (a.unseen) { c.classList.add("asleep", "unseen", "blocked"); c.setAttribute("aria-disabled", "true"); tip = t("WSL {distro} isn't running, and magpie hasn't seen {agent}'s files there yet: start the distro to change this", { distro: a.asleep, agent: a.name }); }
+      else if (a.asleep) {
+        c.classList.add("asleep");
+        const v = { distro: a.asleep, agent: a.name };
+        if (!problem && !blocked) tip = has ? t("WSL {distro} isn't running: {agent} has it — click to take it away, and magpie writes the change there the next time it runs", v) : t("WSL {distro} isn't running: a click gives it to {agent} the next time the distro runs", v);
+      }
       c.title = a.aside && !problem && !blocked ? tip + "\n" + a.aside : tip;
       c.setAttribute("aria-pressed", has ? "true" : "false");
       // What's lit is read off the chips clicked, not the list they were
@@ -293,12 +319,13 @@ magpie.plugin("library", (ctx) => {
   // The agents a row's chips have lit by a click: not one lit because it
   // has the item whatever is ticked.
   function litOf(box) {
-    return [...box.children].filter((x) => x.dataset.agent && !x.classList.contains("always") && x.getAttribute("aria-pressed") === "true").map((x) => x.dataset.agent);
+    return [...box.children].filter((x) => x.dataset.agent && !x.classList.contains("always") && !x.classList.contains("unseen") && x.getAttribute("aria-pressed") === "true").map((x) => x.dataset.agent);
   }
-  // What a click leaves as it was: an agent not shown, and one that has the
-  // item whatever is ticked, whose chip can't be clicked.
+  // What a click leaves as it was: an agent not shown, one that has the
+  // item whatever is ticked, whose chip can't be clicked, and one in a
+  // stopped distro magpie can't show the ticks of (unseen).
   function keptOf(box, all, on) {
-    const fixed = [...box.children].filter((x) => x.classList.contains("always")).map((x) => x.dataset.agent);
+    const fixed = [...box.children].filter((x) => x.classList.contains("always") || x.classList.contains("unseen")).map((x) => x.dataset.agent);
     return on.filter((id) => !all.some((x) => x.id === id) || fixed.includes(id));
   }
 
@@ -955,6 +982,8 @@ magpie.plugin("library", (ctx) => {
       card.append(acts);
     }
     body.append(card);
+    // an agent in WSL runs its distro's own RTK (rtk_wsl.go): one card each
+    for (const d of rtk.wsl || []) body.append(rtkDistroCard(d));
     const rh = el("div", "row-head");
     rh.append(el("span", "label", t("Agents")), el("span", "grow"), el("span", "note", t("restart an agent after switching it")));
     body.append(rh);
@@ -965,22 +994,31 @@ magpie.plugin("library", (ctx) => {
       const who = el("div", "who");
       who.append(el("div", "name", a.name));
       row.append(icon(a.icon), who, el("span", "grow"));
+      // an agent in WSL: its distro's RTK, not this computer's
+      const kind = a.id.split("@")[0];
+      const d = a.wsl ? (rtk.wsl || []).find((x) => x.name === a.wsl) : null;
+      const path = a.wsl ? d?.path : rtk.path, offPath = a.wsl ? d?.offPath : rtk.offPath;
+      if (a.asleep) row.append(tag(t("Not running"), "", t("WSL {distro} isn't running: magpie doesn't start it to read or change {agent}. Start the distro, then Check again.", { distro: a.wsl, agent: a.name })));
       // its hook calls an rtk that isn't there: switching it off still works
-      if (a.on && !rtk.path) row.append(tag(t("RTK missing"), "warn", t("{agent}'s hook calls rtk, which isn't installed, so its shell commands fail. Install RTK, or switch this off.", { agent: a.name })));
+      else if (a.on && !path) row.append(tag(t("RTK missing"), "warn", a.wsl
+        ? t("{agent}'s hook calls rtk, which isn't installed in WSL {distro}, so its shell commands fail. Install RTK there, or switch this off.", { agent: a.name, distro: a.wsl })
+        : t("{agent}'s hook calls rtk, which isn't installed, so its shell commands fail. Install RTK, or switch this off.", { agent: a.name })));
       // …or one that is, off the PATH the agent gets
-      else if (a.on && rtk.offPath) row.append(tag(t("Not on PATH"), "warn", t("{agent}'s hook runs rtk by name and can't find it, so RTK does nothing for it. Put RTK on PATH above.", { agent: a.name })));
+      else if (a.on && offPath) row.append(tag(t("Not on PATH"), "warn", a.wsl
+        ? t("{agent}'s hook runs rtk by name and can't find it in WSL {distro}, so RTK does nothing for it. Add RTK's folder to PATH there.", { agent: a.name, distro: a.wsl })
+        : t("{agent}'s hook runs rtk by name and can't find it, so RTK does nothing for it. Put RTK on PATH above.", { agent: a.name })));
       // an agent RTK has no hook for (rtkNoHook in rtk.go): listed, with its own why
       if (a.noHook) row.append(tag(t("No RTK hook"), "warn", rtkNoHookWhy(a)));
       // RTK before 0.51 installs Antigravity's hook only per project
-      else if (a.blocked && a.id === "agy") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.51 or newer: older ones install it only per project. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
-      else if (a.blocked && a.id !== "opencode") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.50 or newer: older ones only add @RTK.md to AGENTS.md, which rewrites no command. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
+      else if (a.blocked && kind === "agy") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.51 or newer: older ones install it only per project. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
+      else if (a.blocked && kind !== "opencode") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.50 or newer: older ones only add @RTK.md to AGENTS.md, which rewrites no command. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
       // OpenCode 2 loads only the plugin RTK 0.52 on writes (rtk-ai/rtk#4187);
       // an older one's, already there, can be switched off
       else if (a.blocked) row.append(tag(t("Update RTK"), "warn", a.on
         ? t("OpenCode 2 refuses to load this plugin: RTK before 0.52 writes it for OpenCode 1. Update RTK (brew upgrade rtk, or its installer again) and switch it on again, or switch this off.")
         : t("OpenCode 2 needs RTK 0.52 or newer: older ones write a plugin for OpenCode 1, which OpenCode 2 refuses to load. Update RTK (brew upgrade rtk, or its installer again), then switch it on.")));
       const sw = toggle(a.on, t("{agent} runs its commands through RTK", { agent: a.name }), (on) => setRTK(a, on));
-      if ((!rtk.path && !a.on) || (a.blocked && !a.on) || rtkBusy.has(a.id) || rtkInstalling || rtkUpgrading) sw.disabled = true;
+      if ((!path && !a.on) || a.asleep || (a.blocked && !a.on) || rtkBusy.has(a.id) || rtkInstalling || rtkInstallingIn || rtkUpgrading) sw.disabled = true;
       row.append(sw);
       list.append(row);
     }
@@ -994,7 +1032,7 @@ magpie.plugin("library", (ctx) => {
   // two together. An agent with no entry gets no reason and no link.
   function rtkNoHookWhy(a) {
     const agent = a.name;
-    switch (a.id) {
+    switch (a.id.split("@")[0]) {
       case "dsh": return t("RTK can't be given to {agent} yet: RTK works by rewriting the shell command an agent is about to run, and {agent}'s hooks can only allow or deny a command, not change it. RTK's installer has no option for it either (github.com/rtk-ai/rtk/issues/3847).", { agent });
       case "grok": return t("RTK can't be given to {agent} yet: RTK's installer has no option for Grok Build (github.com/rtk-ai/rtk/issues/2136).", { agent });
       case "grok-app": return t("RTK can't be given to {agent} yet: {agent} runs Grok Build, and RTK's installer has no option for Grok Build (github.com/rtk-ai/rtk/issues/2136).", { agent });
@@ -1117,6 +1155,61 @@ magpie.plugin("library", (ctx) => {
     rtkPathing = false;
     render();
   }
+  // RTK in a WSL distro: its agents' hooks run there, so they run its own
+  // rtk, installed by RTK's own Linux script run in the distro. A distro
+  // that isn't running is never started for it.
+  let rtkInstallingIn = "";
+  const rtkInstallErrIn = {};
+  function rtkDistroCard(d) {
+    const card = el("div", "list lib-card lib-rtk-wsl");
+    const ttl = el("div", "lib-cardhead");
+    ttl.append(el("b", "", t("RTK in WSL {distro}", { distro: d.name })), el("span", "grow"));
+    if (d.path) ttl.append(el("span", "note mono", d.version ? "v" + d.version : d.path));
+    card.append(ttl);
+    const acts = el("div", "lib-acts");
+    const again = (cls) => button(t("Check again"), cls, () => { rtk = null; render(); });
+    if (d.asleep) {
+      card.append(el("p", "lib-rtk-gain", t("WSL {distro} isn't running: magpie doesn't start it to look for RTK or change its agents. Start the distro, then Check again.", { distro: d.name })));
+      acts.append(again("action"));
+    } else if (!d.path) {
+      const installing = rtkInstallingIn === d.name;
+      card.append(el("p", "lib-rtk-gain", installing
+        ? t("Installing RTK in WSL {distro}… this can take a minute.", { distro: d.name })
+        : d.install
+          ? t("RTK isn't installed in WSL {distro}. Agents there run their hooks in the distro, so they need RTK there: magpie can run RTK's own installer in it.", { distro: d.name })
+          : t("magpie couldn't look for RTK in WSL {distro}.", { distro: d.name })));
+      if (d.install) card.append(el("p", "lib-rtk-cmd", d.install));
+      if (rtkInstallErrIn[d.name] && !installing) card.append(el("p", "lib-rtk-note lib-rtk-err lib-rtk-install-err", t("The install failed: {why}", { why: rtkInstallErrIn[d.name] })));
+      if (d.install) {
+        const ib = button(installing ? t("Installing…") : t("Install RTK in WSL {distro}", { distro: d.name }), "action", () => installRTKIn(d.name));
+        ib.disabled = !!rtkInstallingIn || rtkInstalling;
+        acts.append(ib);
+      }
+      acts.append(again(d.install ? "" : "action"));
+    } else if (d.offPath) {
+      const dir = d.path.replace(/\/[^/]*$/, "");
+      card.append(el("p", "lib-rtk-note lib-rtk-offpath", t("RTK is in {dir} in WSL {distro}, which isn't on its shells' PATH. Agents there run rtk by name, so they can't find it. Add {dir} to PATH in your shell profile there, then Check again.", { dir, distro: d.name })));
+      acts.append(again("action"));
+    } else {
+      card.append(el("p", "lib-rtk-gain", t("Agents in WSL {distro} run its own RTK, at {path}. What it saves there is in its own count (rtk gain in the distro), not the one above.", { distro: d.name, path: d.path })));
+    }
+    if (acts.childNodes.length) card.append(acts);
+    return card;
+  }
+  async function installRTKIn(distro) {
+    rtkInstallingIn = distro;
+    delete rtkInstallErrIn[distro];
+    render();
+    try {
+      rtk = await api("library/rtk/install", { distro });
+      status(t("RTK is installed in WSL {distro} — switch it on for its agents below", { distro }), "ok", 6000);
+    } catch (e) {
+      rtkInstallErrIn[distro] = e.message;
+      status(e.message, "err", 10000);
+    }
+    rtkInstallingIn = "";
+    render();
+  }
   let rtkInstalling = false, rtkInstallErr = "";
   async function installRTK() {
     rtkInstalling = true;
@@ -1230,7 +1323,7 @@ magpie.plugin("library", (ctx) => {
     for (const a of rows) list.append(...instructionsRow(a));
     if (!rows.length) list.append(el("div", "lib-none", t("None of your agents reads a user-wide instructions file magpie knows.")));
     body.append(list);
-    const skip = shownAgents().filter((a) => !a.instructions);
+    const skip = shownAgents().filter((a) => !a.instructions && !a.asleep);
     if (skip.length) body.append(el("p", "lib-aside", t(skip.length > 1 ? "{agents} keep no user-wide instructions file." : "{agents} keeps no user-wide instructions file.", { agents: skip.map((a) => a.name).join(", ") })));
     body.append(bar);
   }
@@ -1529,6 +1622,7 @@ magpie.plugin("library", (ctx) => {
     if (lib.servers.length || lib.projects.length) renderProjects(body, "mcp");
     const skip = shownAgents().filter((a) => !a.mcp);
     if (skip.length) body.append(el("p", "lib-aside", t("{agents} has no MCP servers magpie can write.", { agents: skip.map((a) => a.name).join(", ") })));
+    body.append(...asleepAsides());
     // WorkBuddy connects a server only once it is trusted there, again
     // after its command or address changes (#1266)
     for (const wb of shownAgents().filter((a) => (a.id === "workbuddy" || a.id === "workbuddy-ai") && a.mcp)) {
@@ -1571,7 +1665,7 @@ magpie.plugin("library", (ctx) => {
     connect.classList.add("lib-hubconnect");
     at.append(glyph(GLYPH.web), aw, copyBtn(hubURL(), t("Address")), connect);
     list.append(at);
-    const names = (why) => mcpAgents().filter((a) => a.hub === why).map((a) => a.name).join(", ");
+    const names = (why) => hubAgents().filter((a) => a.hub === why).map((a) => a.name).join(", ");
     const why = [
       ["no-remote", "{agents} reaches no MCP server over HTTP, so it keeps each server's own entry."],
       ["taken", "A server in the library is called magpie, so {agents} keeps each server's own entry: give that server another name for the hub to be used."],
@@ -1598,7 +1692,7 @@ magpie.plugin("library", (ctx) => {
       const n = known.reduce((sum, s) => sum + Math.max(0, (health.get(s.name).h.tools || 0) - (s.disabledTools?.length || 0)), 0);
       parts.push(n === 1 ? t("1 tool") : t("{n} tools", { n }));
     }
-    const given = mcpAgents().filter((a) => a.hub === "on").map((a) => a.name);
+    const given = hubAgents().filter((a) => a.hub === "on").map((a) => a.name);
     if (given.length) parts.push(t("in {agents}", { agents: given.length > 3 ? t("{first} and {n} more", { first: given.slice(0, 2).join(", "), n: given.length - 2 }) : given.join(", ") }));
     return parts.join(" · ");
   }
@@ -1726,7 +1820,7 @@ magpie.plugin("library", (ctx) => {
     };
 
     const drawAgents = () => {
-      const all = mcpAgents();
+      const all = hubAgents();
       const st = (a) => a.hub || (a.noRemote ? "no-remote" : "");
       const can = all.filter((a) => st(a) === "on" || !st(a));
       const on = can.filter((a) => st(a) === "on");
@@ -1835,7 +1929,7 @@ magpie.plugin("library", (ctx) => {
       pane.scrollTop = top;
       if (focus) { const i = pane.querySelector("#lib-hubq"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
       // the one primary action: Connect all while there are agents to connect
-      const rest = hubTab === "agents" && served().length ? mcpAgents().filter((a) => !a.hub && !a.noRemote) : [];
+      const rest = hubTab === "agents" && served().length ? hubAgents().filter((a) => !a.hub && !a.noRemote) : [];
       bar.replaceChildren(el("span", "grow lib-hubnote", changed ? t("Restart an agent for it to read the change") : ""), done);
       done.className = "text" + (rest.length ? "" : " primary");
       done.disabled = false;
@@ -3056,6 +3150,10 @@ magpie.plugin("library", (ctx) => {
       }
       if (lib.skills.length > 1 && all.length) rh.append(pickButton("skills"), ...everyButtons("skills", all));
       if (byAgentRows("skills").length) rh.append(byAgentButton("skills"));
+      // every one kept in ~/.agents/skills, moved into the library at once
+      // (tnt1223); a row moves its own
+      const kept = lib.skills.filter((s) => s.shared);
+      if (kept.length > 1) rh.append(handOverButton(kept));
       if (lib.skills.length > 1) rh.append(removeEveryButton("skills"));
       if (lib.skills.some((s) => s.kind === "github" || s.kind === "git")) {
         const c = button(checking ? t("Checking…") : t("Check for updates"), "lib-updall", () => checkSkills());
@@ -3144,6 +3242,7 @@ magpie.plugin("library", (ctx) => {
     if (lib.skills.length || lib.projects.length) renderProjects(body, "skills");
     const skip = shownAgents().filter((a) => !a.skills);
     if (skip.length) body.append(el("p", "lib-aside", t("{agents} has no skills folder.", { agents: skip.map((a) => a.name).join(", ") })));
+    body.append(...asleepAsides());
     // Desktop reads its skills list again only when its window is reloaded (#638)
     if (shownAgents().some((a) => a.id === "claude-desktop" && a.skills)) {
       body.append(el("p", "lib-aside", t("Claude Desktop shows skill changes once its window is reloaded ({keys}). It gets a copy of each skill, and one you change in Desktop is left as it is.", { keys: /^Mac/.test(navigator.platform) ? "⌘R" : "Ctrl+R" })));
@@ -5007,6 +5106,9 @@ magpie.plugin("library", (ctx) => {
       } else {
         src.append(el("span", "", t("linked from")), pathLink(s.source));
       }
+      // kept in ~/.agents/skills, which some agents read themselves: moved
+      // into the library, each of them can be turned off (tnt1223)
+      if (s.shared) src.append(handOverButton([s]));
       who.append(src);
     }
     const acts = el("div", "lib-rowacts");
@@ -5130,6 +5232,83 @@ magpie.plugin("library", (ctx) => {
     ed.append(bar);
     modal = { save: () => go.click() };
     openLib(ed);
+  }
+
+  // Skills kept in ~/.agents/skills (tnt1223 on Discord): agents that read
+  // that folder themselves have each whatever is ticked, so none can be
+  // turned off for one of them. Manage in magpie moves them into the
+  // library's own folder, asking first and saying where they go; the
+  // agents that read them there are ticked, and keep them till unticked.
+  function handOverButton(skills) {
+    const one = skills.length === 1;
+    const b = button(one ? t("Manage in magpie") : t("Manage {n} in magpie", { n: skills.length }), one ? "lib-handover" : "action lib-updall lib-handover", (e) => {
+      e.stopPropagation();
+      confirmHandOver(skills);
+    });
+    b.title = one ? t("Move it out of ~/.agents/skills into magpie's library, so you choose which agents get it")
+      : t("Move these {n} from ~/.agents/skills into magpie's library, so you choose which agents get them", { n: skills.length });
+    return b;
+  }
+
+  function confirmHandOver(skills) {
+    const one = skills.length === 1, s = skills[0];
+    const ed = el("div", "editor lib-editor lib-handover-ask");
+    const head = el("div", "ehead");
+    head.append(glyph(GLYPH.skill), el("b", "", one ? t("Manage {name} in magpie?", { name: s.name }) : t("Manage {n} skills in magpie?", { n: skills.length })));
+    ed.append(head);
+    const readers = [...new Set(skills.flatMap((x) => x.always || []))].map(nameOf).filter(Boolean).join(", ");
+    // the entry only links to a folder elsewhere: only the link goes
+    ed.append(el("p", "lib-confirm", one
+      ? (s.sharedElsewhere ? t("Its entry in ~/.agents/skills, a link to {path}, is taken away. The folder stays where it is, and the library links to it.", { path: tilde(s.source) })
+        : t("Its folder moves from {from} into magpie's library folder, {to}.", { from: tilde(s.shared), to: tilde(libSkillPath(s.name)) }))
+      : t("Their folders move from ~/.agents/skills into magpie's library folder, {to}. One that only links there to a folder elsewhere keeps that folder; only the link goes.", { to: tilde(libSkillPath("")) })));
+    if (readers) ed.append(el("p", "lib-confirm", one
+      ? t("{agents} read ~/.agents/skills themselves. They keep it, ticked here, and you can turn it off for any of them, or on this computer only.", { agents: readers })
+      : t("{agents} read ~/.agents/skills themselves. They keep them, ticked here, and you can turn each off for any of them, or on this computer only.", { agents: readers })));
+    ed.append(el("p", "lib-confirm lib-muted", one
+      ? t("To put it back: {cmd}", { cmd: "magpie library skill hand-back " + s.name })
+      : t("To put one back: {cmd}", { cmd: "magpie library skill hand-back <name>" })));
+    const bar = el("div", "bar");
+    const go = button(t("Move into the library"), "primary", async () => {
+      go.disabled = true;
+      if (await handOverSkills(skills.map((x) => x.name))) closeLibModal(true);
+      else go.disabled = false;
+    });
+    bar.append(el("span", "grow"), button(t("Cancel"), "", closeLibModal), go);
+    ed.append(bar);
+    modal = { save: () => go.click() };
+    openLib(ed);
+  }
+
+  // where the library keeps a skill's folder: skills/<name> in its own
+  function libSkillPath(name) {
+    const dir = lib.dir || "", sep = dir.includes("\\") ? "\\" : "/";
+    return dir + sep + "skills" + (name ? sep + name : "");
+  }
+
+  async function handOverSkills(names) {
+    if (changing) return false;
+    changing = true;
+    page.setAttribute("aria-busy", "true");
+    status(t("Saving…"), "", 120000);
+    try {
+      const v = await api("library/skills/hand-over", { names });
+      take(v);
+      status("");
+      const res = v.result || {}, no = res.unmoved || [];
+      const moved = names.filter((x) => !no.some((p) => p.what === "skill:" + x));
+      const done = moved.length === 1 ? t("{name} is in magpie's library now", { name: moved[0] }) : t("{n} skills are in magpie's library now", { n: moved.length });
+      if (no.length) status((moved.length ? done + " · " : "") + t("{name} wasn't moved: {error}", { name: no[0].what.replace(/^skill:/, ""), error: no[0].error }) + (no.length > 1 ? " " + t("(and {n} more)", { n: no.length - 1 }) : ""), "warn", 10000);
+      else report(res, done);
+      return true;
+    } catch (e) {
+      status(e.message, "err", 6000);
+      return false;
+    } finally {
+      changing = false;
+      page.removeAttribute("aria-busy");
+      render();
+    }
   }
 
   function confirmRemoveSkill(s) {

@@ -151,7 +151,7 @@ async function api(path, body, heads, signal) {
       err.message = t("None of magpie's models is left in {agent}'s model list: pick one under Model list → Pick, then connect {agent}", { agent: data.agent });
     }
     if (data?.why) err.why = data.why; // a failed move's reason, said in the reader's language
-    if (data?.code === "bun_unstartable") err.message = t(data.said); // bunSaid in api.go: an i18n.js key
+    if (data?.said) err.message = t(data.said, data); // an i18n.js key (api.go)
     // an account the agent is signed in to, refused removal while it has
     // another: said in the reader's language
     if (data?.code === "signed_in") {
@@ -2706,7 +2706,7 @@ function importButton(a) {
   b.onclick = (ev) => {
     ev.stopPropagation();
     if (web) location.href = a.import;
-    else api("open", { url: a.import });
+    else api("open", { url: a.import }).then(() => status(t("Sent to {name}: confirm adding magpie there", a), "ok"), (e) => status(e.message, "err"));
   };
   return b;
 }
@@ -5986,7 +5986,7 @@ async function loadProvidersNow() {
   if (!providers.providers.length && editing === null && !providers.fileError) adding = true;
   if (providersPage(view)) {
     magpie.call(view, "render", was);
-    backToReader($("#view-" + view));
+    backAfterLoad($("#view-" + view));
   } else renderProviders();
   renderArchive();
   providersWhileFetching();
@@ -11849,13 +11849,16 @@ function renderFallback(p) {
   const box = el("div", "fallback");
   const list = el("div", "fbl");
   const sugg = el("div", "mchips");
-  const q = input("", t("add a model: filter, or type provider/model…"));
+  const q = input("", t("add a model or routing group: filter, or type provider/model…"));
   const all = [];
+  // a routing group too, routed as itself (01huadalang)
+  for (const g of providers.gateway?.groups || []) all.push({ id: g.id, label: g.name, g: g.providers?.join(" ") || "" });
   for (const o of providers.providers) {
     if (!o.ready || o.off) continue;
     const tells = modelTells(o.models.filter((m) => m.on));
     for (const m of o.models) if (m.on) all.push({ id: o.id + "/" + m.id, label: o.name + " · " + (m.name || m.id) + (tells.has(m.id) ? " · " + tells.get(m.id) : ""), icon: o.icon });
   }
+  const tell = () => el("span", "mtell", t("routing group"));
   let open = false;
   const add = (id) => { if (id && !draft.fallback.includes(id)) draft.fallback.push(id); q.value = ""; draw(); };
   const draw = () => {
@@ -11863,8 +11866,9 @@ function renderFallback(p) {
     draft.fallback.forEach((id, i) => {
       const known = all.find((x) => x.id === id);
       const row = el("div", "fbrow");
-      row.append(el("span", "i", String(i + 1)), icon(known?.icon || "generic"), el("span", "n", known ? known.label : id), el("span", "grow"));
-      if (!known) row.title = t("No provider serves {id} now; it is skipped", { id });
+      const g = id.startsWith("group/");
+      row.append(el("span", "i", String(i + 1)), g ? svg(FAN, 16, 1.5) : icon(known?.icon || "generic"), el("span", "n", known ? known.label : id), ...(g ? [tell()] : []), el("span", "grow"));
+      if (!known) row.title = t(g ? "No routing group {id} now; it is skipped" : "No provider serves {id} now; it is skipped", { id });
       if (i) {
         const up = el("button", "text", t("Up"));
         up.onclick = () => { draft.fallback.splice(i - 1, 0, draft.fallback.splice(i, 1)[0]); draw(); };
@@ -11878,10 +11882,10 @@ function renderFallback(p) {
     sugg.replaceChildren();
     if (!open && !q.value.trim()) return;
     const f = q.value.trim().toLowerCase();
-    const hits = all.filter((x) => !draft.fallback.includes(x.id) && !x.id.startsWith(p.id + "/") && (x.id + " " + x.label).toLowerCase().includes(f));
+    const hits = all.filter((x) => !draft.fallback.includes(x.id) && !x.id.startsWith(p.id + "/") && (x.id + " " + x.label + " " + (x.g ?? "")).toLowerCase().includes(f));
     for (const x of hits.slice(0, 12)) {
       const c = el("button", "mchip");
-      c.append(el("span", "", x.label));
+      c.append(...(x.g != null ? [svg(FAN, 12, 1.5), el("span", "", x.label), tell()] : [el("span", "", x.label)]));
       c.title = x.id;
       c.onmousedown = (e) => e.preventDefault(); // keep the box focused
       c.onclick = () => add(x.id);
@@ -11889,7 +11893,7 @@ function renderFallback(p) {
     }
     // only the first dozen are drawn: the rest are said to be there
     if (hits.length > 12) sugg.append(el("span", "hint", t("{n} more — type to narrow", { n: hits.length - 12 })));
-    if (!hits.length && f) sugg.append(el("span", "hint", f.includes("/") ? t("Enter adds {id}", { id: q.value.trim() }) : t("No model matches")));
+    if (!hits.length && f) sugg.append(el("span", "hint", f.includes("/") ? t("Enter adds {id}", { id: q.value.trim() }) : t("No model or routing group matches")));
   };
   q.onfocus = () => { open = true; draw(); };
   q.onblur = () => { open = false; draw(); };
@@ -13705,6 +13709,29 @@ function capMark(track, w, cap) {
   track.classList.add("capped");
   track.append(mk);
 }
+// a number typed where a pill was: Enter or leaving saves what parse makes
+// of it (null: not one, said in bad), Escape keeps own
+const capOf = (v) => { v = parseInt(v.replace("%", ""), 10); return v >= 1 && v <= 99 ? v : null; };
+function pillNumber(at, val, ph, cls, label, parse, bad, own, set) {
+  const i = input(val, ph, "text");
+  i.className = "rename-in " + cls;
+  i.inputMode = "numeric";
+  i.setAttribute("aria-label", label);
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const s = i.value.trim(), v = parse(s);
+    if (save && s && v == null) { status(bad, "err"); renderProviders(); return; }
+    if (save && s && v !== own) set(v);
+    else renderProviders();
+  };
+  i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") finish(true); else if (e.key === "Escape") finish(false); };
+  i.onblur = () => finish(true);
+  at.replaceWith(i);
+  i.focus({ preventScroll: true });
+}
+
 // windowCapMeter: a window's meter on an account's row as the button that
 // sets the window's own cap, in the app's menu: the account's cap, none on
 // this window, a share, or one typed in place. A window of a model family
@@ -13733,25 +13760,7 @@ function windowCapMeter(m, p, user, w) {
     v === 0 ? t("{window} of {who} follows the account's cap", { window: name, who: user })
       : v >= 100 ? t("{window} of {who} has no cap", { window: name, who: user })
       : t("{who} stops at {n}% of {window}", { who: user, n: v, window: name }));
-  const other = () => {
-    const i = input(own && own < 100 ? String(own) : "", "1–99", "text");
-    i.className = "rename-in acap-in";
-    i.inputMode = "numeric";
-    i.setAttribute("aria-label", t("Cap for {window}, in percent", { window: name }));
-    let done = false;
-    const finish = (save) => {
-      if (done) return;
-      done = true;
-      const v = parseInt(i.value.replace("%", "").trim(), 10);
-      if (save && i.value.trim() && !(v >= 1 && v <= 99)) { status(t("A cap is a share from 1% to 99%"), "err"); renderProviders(); return; }
-      if (save && i.value.trim() && v !== own) set(v);
-      else renderProviders();
-    };
-    i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") finish(true); else if (e.key === "Escape") finish(false); };
-    i.onblur = () => finish(true);
-    b.replaceWith(i);
-    i.focus({ preventScroll: true });
-  };
+  const other = () => pillNumber(b, own && own < 100 ? String(own) : "", "1–99", "acap-in", t("Cap for {window}, in percent", { window: name }), capOf, t("A cap is a share from 1% to 99%"), own, set);
   b.onclick = (e) => {
     e.stopPropagation();
     if (b.classList.contains("open")) return closeProtoMenu();
@@ -13783,26 +13792,8 @@ function accountCapPill(p, user, cap, direct) {
   pill.setAttribute("aria-expanded", "false");
   const set = (v) => accountAction("provider/accountcap", { id: p.id, account: user, cap: v },
     v ? t("{who} stops at {n}% of each window", { who: user, n: v }) : t("{who} has no usage cap", { who: user }));
-  const other = () => {
-    // a share of the user's own, typed where the pill was
-    const i = input(cap ? String(cap) : "", "1–99", "text");
-    i.className = "rename-in acap-in";
-    i.inputMode = "numeric";
-    i.setAttribute("aria-label", t("Usage cap, in percent"));
-    let done = false;
-    const finish = (save) => {
-      if (done) return;
-      done = true;
-      const v = parseInt(i.value.replace("%", "").trim(), 10);
-      if (save && i.value.trim() && !(v >= 1 && v <= 99)) { status(t("A cap is a share from 1% to 99%"), "err"); renderProviders(); return; }
-      if (save && i.value.trim() && v !== cap) set(v);
-      else renderProviders();
-    };
-    i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") finish(true); else if (e.key === "Escape") finish(false); };
-    i.onblur = () => finish(true);
-    pill.replaceWith(i);
-    i.focus({ preventScroll: true });
-  };
+  // a share of the user's own, typed where the pill was
+  const other = () => pillNumber(pill, cap ? String(cap) : "", "1–99", "acap-in", t("Usage cap, in percent"), capOf, t("A cap is a share from 1% to 99%"), cap, set);
   pill.onclick = (e) => {
     e.stopPropagation();
     if (pill.classList.contains("open")) return closeProtoMenu();
@@ -13864,25 +13855,7 @@ function laneLimitPill(p, ref, who, name) {
   const own = laneOwnOf(p, ref);
   const set = (v) => accountAction("provider/accountconcurrency", { id: p.id, account: ref, limit: v },
     v == null ? t("{who} takes the provider's limit", { who: name }) : v ? t("{who}: at most {n} requests at once", { who: name, n: v }) : t("{who}: no limit on requests at once", { who: name }));
-  const other = () => {
-    const i = input(own ? String(own) : "", "1–1000", "text");
-    i.className = "rename-in alane-in";
-    i.inputMode = "numeric";
-    i.setAttribute("aria-label", t("Requests at once"));
-    let done = false;
-    const finish = (save) => {
-      if (done) return;
-      done = true;
-      const v = i.value.trim();
-      if (save && v && !(/^\d+$/.test(v) && +v <= 1000)) { status(t("Concurrency: a whole number from 0 to 1000"), "err"); renderProviders(); return; }
-      if (save && v && +v !== own) set(+v);
-      else renderProviders();
-    };
-    i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") finish(true); else if (e.key === "Escape") finish(false); };
-    i.onblur = () => finish(true);
-    pill.replaceWith(i);
-    i.focus({ preventScroll: true });
-  };
+  const other = () => pillNumber(pill, own ? String(own) : "", "1–1000", "alane-in", t("Requests at once"), (v) => /^\d+$/.test(v) && +v <= 1000 ? +v : null, t("Concurrency: a whole number from 0 to 1000"), own, set);
   pill.onclick = (e) => {
     e.stopPropagation();
     if (pill.classList.contains("open")) return closeProtoMenu();
@@ -14320,7 +14293,7 @@ function renderKeyAccounts(p) {
     // a line of its own under the key's, so the row's controls stay in reach
     let restLine = null;
     if (k.rest && new Date(k.rest.until) > Date.now()) {
-      const r = el("span", "key-rest", t("Resting · {why} · back at {time}", { why: (k.rest.status ? k.rest.status + " " : "") + t(KEY_FAIL[k.rest.why] || "failed"), time: new Date(k.rest.until).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }) }));
+      const r = el("span", "key-rest", t("Resting · {why} · back at {time}", { why: (k.rest.status ? k.rest.status + " " : "") + t(KEY_FAIL[k.rest.why] || "failed"), time: hhmm(k.rest.until) }) + (k.rest.probed ? " · " + t("checked in the background, back as soon as it answers") : ""));
       r.title = t("The gateway passes this key over until then, and tries the next one");
       // lifted by hand (#1869): the next request asks it again, and a
       // refusal then rests it again as before
@@ -17412,10 +17385,12 @@ function resetsWords(r, q) {
     w.title = r.each?.length ? resetsEach(r) : t("The first runs out {when}", { when: at.toLocaleString(intlLang()) });
     // whether the one that runs out first is kept from going to waste:
     // with Auto-use on it is used shortly before it does (#624, #719)
+    // or, the week's alone, when the week runs out (tongzhenbao on X)
     if (q && autoResetKept(q)) {
-      const on = autoResetWhen(q).expiring;
-      w.append(el("span", "resets-kept" + (on ? " on" : ""), " · " + t(on ? "auto-used before it expires" : "not auto-used")));
-      w.title += "\n" + t(on ? "Auto-use is on: the reset that runs out first is used about half an hour before it does, if this account's windows have been used, so what they have left can be used until then and it isn't lost; at once if the account is held up until after then."
+      const { expiring: x, week } = autoResetWhen(q);
+      w.append(el("span", "resets-kept" + (x || week ? " on" : ""), " · " + t(x ? "auto-used before it expires" : week ? "auto-used when the week runs out" : "not auto-used")));
+      w.title += "\n" + t(x ? "Auto-use is on: the reset that runs out first is used about half an hour before it does, if this account's windows have been used, so what they have left can be used until then and it isn't lost; at once if the account is held up until after then."
+        : week ? "Auto-use is on for a used-up week: a reset is used by itself when this account's week is used up, before its credits are spent. One about to run out is otherwise lost unless it's used by hand or the week runs out before then."
         : "Auto-use is off: the reset that runs out first is lost unless it's used by hand before then.");
     }
   } else if (r.each?.length) w.title = resetsEach(r);
@@ -17523,12 +17498,9 @@ function resetsUsedLine(q) {
   if (!used.length) return null;
   const line = el("span", "ar-used");
   const last = used[0];
-  line.textContent = t("Last reset used: {when} · {why}", { when: resetUsedWhen(last.at), why: resetUsedWhy(last.why) });
-  line.title = used.map((u) => resetUsedWhen(u.at) + " · " + resetUsedWhy(u.why)).join("\n");
+  line.textContent = t("Last reset used: {when} · {why}", { when: stamp(last.at), why: resetUsedWhy(last.why) });
+  line.title = used.map((u) => stamp(u.at) + " · " + resetUsedWhy(u.why)).join("\n");
   return line;
-}
-function resetUsedWhen(at) {
-  return new Date(at).toLocaleString(intlLang(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 function resetUsedWhy(why) {
   if (why === "week") return t("by itself, its week used up");
@@ -19675,7 +19647,7 @@ function renderSettings() {
   row(t("Community"), t("questions, ideas and feedback, on Discord or GitHub"), "", join, repo);
   // gateway mode leaves out what is written into this computer's agents'
   // files, and the alerts its desktop would show
-  for (const r of [$("#plainNamesSegs").parentElement, $("#usageAlertRow"), $("#balanceAlertRow"), $("#resetReminderRow"), $("#turnDoneRow")]) r.hidden = gatewayMode;
+  for (const r of [$("#plainNamesSegs").parentElement, $("#usageAlertRow"), $("#balanceAlertRow"), $("#resetReminderRow"), $("#turnDoneRow"), $("#maskAlertRow")]) r.hidden = gatewayMode;
   // the parts' tabs, one gone whose rows are all hidden here
   setSetTab(setTab);
 }
@@ -19979,9 +19951,12 @@ function refreshAfterSync() {
   api("state").then((s) => { state = s; renderAgents(); }).catch(() => {});
 }
 
+// hhmm: a time's hours and minutes, in the user's language
+const hhmm = (d) => new Date(d).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" });
+
 function syncWhen(iso) {
   const d = new Date(iso);
-  const time = d.toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" });
+  const time = hhmm(d);
   return new Date().toDateString() === d.toDateString() ? t("at {time}", { time }) : d.toLocaleDateString(intlLang()) + " " + time;
 }
 
@@ -20855,6 +20830,8 @@ function renderAlerts(s, keep) {
   const turnOpts = [["0", t("Off")], ...mins.map((m) => [String(m * 60), t("{n} min", { n: m })])];
   if (d && !mins.some((m) => m * 60 === d)) turnOpts.push([String(d), d % 60 ? t("{n} s", { n: d }) : t("{n} min", { n: d / 60 })]);
   $("#turnDoneSegs").replaceChildren(segs(turnOpts, String(d), (v) => savePrefs({ ...keep, turnDoneAlert: Number(v) })));
+  // a value masked for the first time (Must2333 on X): off until turned on
+  $("#maskAlertSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.maskAlert ? "on" : "off", (v) => savePrefs({ ...keep, maskAlert: v === "on" })));
 }
 
 // AGENT_PREFS: an agent's own settings, by its id, each a row kept in
@@ -21553,7 +21530,7 @@ function searchKeysRow(s, a, row, set) {
       const notes = [];
       if (q.known && q.of === "plan") notes.push(q.plan ? t("{plan} plan, shared by its account's keys", { plan: q.plan }) : t("the plan's, shared by its account's keys"));
       if (q.paygoLeft > 0) notes.push(t("{n} pay-as-you-go left", { n: num(q.paygoLeft) }));
-      if (q.resting) notes.push(t("asked last until {time}: {why}", { time: new Date(q.restUntil).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }),
+      if (q.resting) notes.push(t("asked last until {time}: {why}", { time: hhmm(q.restUntil),
         why: { "turned away": t("turned away"), "out of credit": t("out of credit"), "rate limited": t("rate limited"), "used up": t("used up") }[q.resting] || q.resting }));
       const used = el("span", q.known ? (q.usedUp ? "used warn" : "used") : "used err", said);
       line.append(el("code", "", q.key), used);
@@ -22781,7 +22758,7 @@ function prefsKeep(s) {
     noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360, autoRestart: !!s.autoRestart, noAutoDownload: !!s.noAutoDownload, updateChannel: s.updateChannel || "",
     trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, trayPace: !!s.trayPace, trayNoCost: !!s.trayNoCost, vision: s.vision || "", visionEffort: s.visionEffort || "", searcherEffort: s.searcherEffort || "", imageGen: s.imageGen || "", imageTimeout: s.imageTimeout || 0, classifyTimeout: s.classifyTimeout || 0, searcher: s.searcher || "", searchFirst: s.searchFirst || "", currency: s.currency || "usd",
     chineseUnits: !!s.chineseUnits, usageAlert: s.usageAlert || 0, balanceAlert: s.balanceAlert || 0, resetReminder: s.resetReminder || 0,
-    turnDoneAlert: s.turnDoneAlert || 0 };
+    turnDoneAlert: s.turnDoneAlert || 0, maskAlert: !!s.maskAlert };
 }
 
 // savePrefs sends what the page was drawn with (prefsBase) and the choice
@@ -22894,6 +22871,25 @@ function puttingBack(v, from, h) {
   if (mine.length < 3 && !(run?.v === v && run.d === d && at - run.at < 1000)) return;
   run = { v, d, at }; putBack = putBack.filter((p) => !mine.includes(p)); flings();
   for (const p of mine) v.scrollTop += p.by;
+  if (!deaf) { deaf = true; try { localStorage.setItem("magpie.unheardWheels", "1"); } catch {} }
+}
+// Seen once (a run given back, kept for the next start), a scroll at rest
+// waits a moment before it is put back, and one more the same way within
+// 80ms (a frame or few: code's two scrolls come further apart), nothing laid
+// out anew between them, is the reader's: a gesture
+// starts without three put back first. What it puts back is kept, as at
+// once, for a wheel heard late to give back (issennknight, macOS 13: Routing and
+// Usage shook as they were opened and wheeled)
+let deaf = false;
+try { deaf = localStorage.getItem("magpie.unheardWheels") === "1"; } catch {}
+const waits = new WeakMap();
+function waitsBack(v) {
+  const d = Math.sign(Math.round(v.scrollTop - (readerAt.get(v) ?? 0))), w = waits.get(v);
+  if (!d) return false;
+  clearTimeout(w?.t); waits.delete(v);
+  if (w?.d === d && w.h === v.scrollHeight && performance.now() - w.at < 80) { readerWay.set(v, d); readerLeaves(v); flings(); return true; }
+  waits.set(v, { d, h: v.scrollHeight, at: performance.now(), t: setTimeout(() => { waits.delete(v); if (performance.now() >= purposeUntil && held?.v !== v) { const from = v.scrollTop; backToReader(v); puttingBack(v, from, false); } }, 120) });
+  return true;
 }
 // Given back is what was put back after the reader's input was made (its
 // timeStamp is when it was made, not when the page was told) and went the
@@ -23041,6 +23037,15 @@ function backToReader(v) {
     const r = f.getBoundingClientRect(), b = v.getBoundingClientRect();
     if (r.bottom > b.bottom || r.top < b.top) { readerScrolls(1000); guardUntil = purposeUntil; f.scrollIntoView({ block: "nearest" }); }
   }
+}
+// A load come in puts the view back where the reader left it, a redraw
+// having pulled it up; under a wheel the place last heard is late, and a
+// move the way the reader goes (readerWay) is theirs (gui-shell.md)
+const readerWay = new WeakMap();
+function backAfterLoad(v) {
+  const at = readerAt.get(v);
+  if (!v.hidden && (barDrag === v || performance.now() < purposeUntil && at != null && readerWay.get(v) === Math.sign(Math.round(v.scrollTop - at)))) readerLeaves(v);
+  else backToReader(v);
 }
 // Where an element is on the screen in its view. What's held is the element
 // clicked or, once it's gone or hidden (drawn again), the nearest still
@@ -23233,7 +23238,11 @@ for (const v of document.querySelectorAll(".view")) {
   v.addEventListener("scroll", () => {
     if (v.hidden) return;
     if (panning?.v === v) readerScrolls(250);
-    if (performance.now() < purposeUntil || barDrag === v) { fitRoom(v); readerLeaves(v); scrolledFrom.set(v, document.activeElement); return; }
+    if (performance.now() < purposeUntil || barDrag === v) {
+      const by = v.scrollTop - (readerAt.get(v) ?? v.scrollTop);
+      if (Math.abs(by) >= 1) readerWay.set(v, Math.sign(by));
+      fitRoom(v); readerLeaves(v); scrolledFrom.set(v, document.activeElement); return;
+    }
     const from = v.scrollTop;
     // a click's hold takes what a redraw moved; a scroll with the page laid
     // out as the hold left it is put back as at rest, so the reader's run
@@ -23241,6 +23250,7 @@ for (const v of document.querySelectorAll(".view")) {
     // wheeled through, held still for 4s)
     const h = held?.v === v && redrawn(held);
     if (held?.v === v) hold(held);
+    else if (deaf && waitsBack(v)) return;
     else backToReader(v);
     puttingBack(v, from, h);
   }, { passive: true });
@@ -23293,7 +23303,7 @@ async function show(v) {
   navSubs();
   for (const id of ["agents", "providers", "plugins", "settings", ...magpie.pages()]) $("#view-" + id).hidden = v !== id;
   // back to where the reader was in it, and again once it has what it loads
-  const back = () => backToReader($("#view-" + v));
+  const back = () => backAfterLoad($("#view-" + v));
   requestAnimationFrame(back);
   closePicker();
   closeAgentModels();

@@ -85,6 +85,65 @@ is judged as any other. Without it the call was refused 401, never
 reached the run, and every turn with tool results found no run waiting and
 started a new Claude Code told the whole conversation (#1546).
 
+## Claude Code's interactive mode (`claudePrintMode`)
+
+By default a run on macOS and Linux is Claude Code's interactive mode, not
+`claude -p`. Anthropic counts a request by its entrypoint, and a `-p`
+run's `sdk-cli` costs about twice the plan's allowance of the interactive
+mode's `cli` (anthropics/claude-code#97074). The run is the real
+interactive Claude Code: nothing sets `CLAUDE_CODE_ENTRYPOINT`.
+
+The bridge starts `magpie claude-tui-helper <claude> <the -p arguments>`
+(`internal/claudetui`) in place of `claude` when `claudeTUI` says so, and
+talks to it as it talks to `-p`: stream-json in and out. The helper:
+
+- turns the arguments into the interactive mode's (`interactiveArgs`):
+  `-p`, the stream-json formats, `--verbose`,
+  `--include-partial-messages`, `--thinking-display`,
+  `--dangerously-skip-permissions` and `--no-session-persistence` go;
+  `--permission-mode default --allowedTools mcp__magpie[,WebSearch]
+  --no-chrome` come. Permissions are not skipped: only magpie's MCP tools
+  (and the web search `-p` was given) are allowed, and nothing else is
+  offered (`--tools ""`). A new session is given `--session-id`;
+- starts Claude Code in a pseudo-terminal of its own (200x50, its own
+  session), no tmux, and answers what it asks of the terminal;
+- pastes each user message into the prompt (bracketed paste) and presses
+  Enter. A message opening with `/`, `!`, `#` or `&` is pasted after a
+  line break, so it is words, not a command (`pasteable`);
+- tails `<CLAUDE_CONFIG_DIR>/projects/*/<session>.jsonl` and tells each
+  row as `-p` would (`translator`): assistant messages whole (no partial
+  stream), a tool's result, a `<synthetic>` API error as the turn's error
+  result with its `rate_limit_info`, and `turn_duration` as the result.
+
+The user's own `~/.claude.json` and `~/.claude` are never written. Claude
+Code asks whether to trust a folder it has not run in; the helper answers
+yes only when the bridge sets `MAGPIE_CLAUDE_TUI_TRUST=1`, which it does
+for magpie's own working folder or a saved account's config directory,
+both magpie's. In the caller's folder under the account Claude Code is
+signed in to, the question is the user's: a folder the user has not
+trusted makes that run `-p`.
+
+A run is `-p`, as before, when (`claudeTUI`):
+
+- Settings › Models › Replies › Claude Code's interactive mode is Off
+  (`claudePrintMode`);
+- it is Windows, or Claude Code in WSL;
+- the request has safeguards, client cache marks, a JSON schema or images,
+  or a prompt over 400KB (`tuiPromptMost`), which a paste can't carry as
+  `-p` does.
+
+A turn the interactive mode can't take ends the run, and the next starts
+anew: a turn with images, one that takes earlier turns back, an effort
+change. A run given up on (`letGo`) is not taken back, since the
+interactive mode can't answer a control request to stop a turn.
+
+If the interactive Claude Code doesn't start or show its prompt within 45
+seconds, the helper becomes `claude -p` with the same arguments
+(`printMode`, `exec` on the same pid, its input still unread), so the
+turn is answered all the same, and it writes
+`<cache>/magpie/claude-tui-broken`: for 30 minutes after, every run goes
+to `-p` at once. A folder not trusted goes to `-p` without the mark.
+
 ## Why turns go on in one run
 
 A run started anew is told the whole conversation in one user message
@@ -107,7 +166,10 @@ cache.
 
 A client can send `X-Magpie-Cache-Marks: client` on a `/v1/messages`
 request to a Claude subscription. Without that header, the bridge behaves
-as before. Chat Completions and Responses ignore the header. The mode is
+as before — except Claude Code's auto mode classifier, whose own marks are
+kept like an opted-in client's when they are valid, and dropped as before when
+they are not (#3835). Chat Completions and Responses
+ignore the header. The mode is
 part of the run's identity, including rewritten conversations and tool-result
 handoffs: opted-in and ordinary requests never share a run.
 
@@ -122,6 +184,7 @@ to the client. `claude_cache.go` validates the marks before run selection;
 | Top-level `cache_control` | Sets the request-level tail through `CLAUDE_CODE_EXTRA_BODY`. |
 | Last message block | Sets the same request-level tail. |
 | Earlier message block, new run | Ends a block at that point in the rendered history with the same TTL. |
+| Earlier message block without a mark, new run | Ends a block there too, so a mark that moved on with the conversation's growth leaves the old boundary in place for Anthropic's prefix check (#3835). |
 | Earlier message block, running or saved run | Dropped and reported; the existing history cannot be edited. |
 | Tool definition | Dropped and reported; Claude Code owns the tools. |
 | Bridge history-chunk mark | Uses only a free slot and never a longer TTL than a preceding mark. |
@@ -602,6 +665,18 @@ in its system prompt (`leanSystem`), the named-folder note worded as
 `envElsewhereLeanNote` since the environment comes after it there
 (`envNote` picks the note).
 
+Claude Code 2.1.296 and later, as a client, give their own environment
+the same way: a `{role: "system"}` message after the user's first, not
+in the system prompt. For such a caller (`Request.envInTurns`, from
+`clientNamedWorkPlace`) "the environment these instructions describe"
+pointed at instructions that describe none, while the caller's came
+after them as a message (packinggoods again, after v0.1.2093). Its
+instructions, or a lean run's system prompt, end with `envTurnsNote`
+instead: of the environments the conversation gives, the last one is
+where every tool runs. The run's own is always the first, at the start
+of its first message, so the last is the caller's. Not measured: whether
+a real model on a Windows gateway then stops writing PowerShell.
+
 Nothing else of the folder reaches the run. `--setting-sources ""` loads
 no CLAUDE.md, settings or skills from it. Auto memory is off, and
 `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` keeps the repository's status out
@@ -792,6 +867,8 @@ and the next turn starts a run in the new one, as after any restart.
 ```sh
 go test -tags nogui ./internal/gateway/ -run '^TestClaudeClientCache' -count=1
 go test -tags nogui ./internal/gateway/ -run '^TestClaudeLeanPrompt' -count=1
+go test -tags nogui ./internal/gateway/ -run '^TestClaudeTUIChosen$' -count=1
+go test ./internal/claudetui/ -count=1
 go test -tags nogui ./internal/claudecode/ -count=1
 go test -tags nogui ./internal/gateway/ -run '^TestClaudeCodeGivenTheBridgeForASOCKSProxy$' -count=1
 go test -tags nogui ./internal/provider/ -run '^TestClaudeSignInBridgesASOCKSProxy$' -count=1

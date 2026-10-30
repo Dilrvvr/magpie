@@ -61,6 +61,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/claudecode"
+	"github.com/yetone/magpie/internal/claudetui"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
@@ -174,6 +175,7 @@ type subscriptionRun struct {
 	safeguardBeta string
 	clientMarks   bool
 	lean          bool // started with leanSystem as its system prompt
+	tui           bool // Claude Code's interactive mode (claudeTUI)
 	cacheTail     string
 	cachePrefix   cachePrefix
 	timer         *time.Timer
@@ -429,28 +431,37 @@ func clientWorkDir(req *Request) string {
 // clientNamedWorkDir is the working directory the caller's instructions
 // name, as they write it, wherever it is; "" when they name none.
 func clientNamedWorkDir(req *Request) string {
-	texts := []string{req.System}
+	dir, _ := clientNamedWorkPlace(req)
+	return dir
+}
+
+// clientNamedWorkPlace is clientNamedWorkDir, and whether the caller
+// named it in a message rather than in its instructions: Claude Code
+// 2.1.296 and later give their environment as a {role: "system"} message
+// after the user's first, so the run is told it in the conversation,
+// after the caller's instructions (envTurnsNote).
+func clientNamedWorkPlace(req *Request) (dir string, inTurns bool) {
+	look := func(t string, turn bool) {
+		for _, m := range clientCwdPattern.FindAllStringSubmatch(t, -1) {
+			for _, g := range m[1:] {
+				if g = strings.Trim(strings.TrimSpace(g), "`'\""); g != "" {
+					dir, inTurns = g, turn
+				}
+			}
+		}
+	}
+	look(req.System, false)
 	for _, m := range req.Messages {
 		if m.Role == "assistant" {
 			continue
 		}
 		for _, p := range m.Parts {
 			if p.Kind == Text {
-				texts = append(texts, p.Text)
+				look(p.Text, true)
 			}
 		}
 	}
-	dir := ""
-	for _, t := range texts {
-		for _, m := range clientCwdPattern.FindAllStringSubmatch(t, -1) {
-			for _, g := range m[1:] {
-				if g = strings.Trim(strings.TrimSpace(g), "`'\""); g != "" {
-					dir = g
-				}
-			}
-		}
-	}
-	return dir
+	return dir, inTurns
 }
 
 var clientCwdPattern = regexp.MustCompile(`(?m)(?:Primary working directory|^\s*(?:-\s*)?Working directory|Current working directory): *([^\r\n]+)$|<cwd>([^<\r\n]+)</cwd>`)
@@ -739,7 +750,9 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	client := work != ""
 	if !client {
 		work, err = claudeWorkDir()
-		req.envElsewhere = clientNamedWorkDir(req) != ""
+		named, inTurns := clientNamedWorkPlace(req)
+		req.envElsewhere = named != ""
+		req.envInTurns = inTurns
 		// a caller on another computer that names no folder: Claude Code's
 		// environment is this computer's, and the tools run on the
 		// caller's (packinggoods on Discord: a Mac client of a Windows
@@ -803,7 +816,16 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 			prefix = promptCachePrefix(prompt)
 		}
 	}
-	cmd := binary.command(context.Background(), args...)
+	// Claude Code's interactive mode, where a run allows it (claudeTUI):
+	// the shim (claudetui) is handed the -p arguments, and becomes that -p
+	// run when the interactive one doesn't start
+	tui := claudeTUI(req, binary, prompt)
+	var cmd *exec.Cmd
+	if tui {
+		cmd = proc.CommandContext(context.Background(), exe, append([]string{claudetui.Command, binary.path}, args...)...)
+	} else {
+		cmd = binary.command(context.Background(), args...)
+	}
 	cmd.Dir = work
 	env, err := binary.proxied(ctx, cleanClaudeEnv(os.Environ()))
 	if err != nil {
@@ -815,6 +837,13 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	}
 	if len(req.Safeguards) > 0 {
 		env = append(env, "ANTHROPIC_BETAS="+req.SafeguardBeta)
+	}
+	if tui && (!client || configDir != "") {
+		// a folder of magpie's, or an account folder of magpie's whose
+		// Claude Code no one else runs: asked whether to trust it, the
+		// shim says yes; in the user's own account a caller's folder is
+		// theirs to answer for, and the run is -p
+		env = append(env, claudetui.TrustEnv+"=1")
 	}
 	cmd.Env = binary.env(binary.asRoot(env), configDir)
 	stdin, err := cmd.StdinPipe()
@@ -845,6 +874,7 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	run.safeguardBeta = req.SafeguardBeta
 	run.clientMarks = req.clientCache != nil
 	run.lean = req.leanPrompt
+	run.tui = tui
 	run.cachePrefix = prefix
 	if user, _ := ownerAccount(owner); user != "" {
 		run.loginVersion = provider.ClaudeLoginVersion(user)
@@ -880,7 +910,7 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		run.readOutput(stdout)
 	}()
 
-	if len(req.Safeguards) > 0 || from != nil || run.clientMarks {
+	if len(req.Safeguards) > 0 || from != nil || run.clientMarks || tui {
 		// Initialize the SDK before applying settings. Send the potentially
 		// large context over stdin rather than an environment entry. A
 		// Claude Code resumed from a saved session answers it only once
@@ -910,6 +940,32 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		return nil, nil, err
 	}
 	return run, segment, nil
+}
+
+// claudeTUIRuns is false where magpie's executable has no shim to run:
+// the gateway's tests, whose fake Claude Codes are -p ones.
+var claudeTUIRuns = true
+
+// tuiPromptMost is the longest first message a run in Claude Code's
+// interactive mode is pasted; a longer one is a -p run's.
+const tuiPromptMost = 400 << 10
+
+// claudeTUI says whether a run is Claude Code's interactive mode, as a
+// person runs it (claudetui), rather than -p: the plan counts a -p
+// request, its entrypoint sdk-cli, at about twice the interactive mode's
+// (anthropics/claude-code#97074). On unless the user turned it off
+// (ClaudePrintMode), on macOS and Linux, for a run whose Claude Code is
+// this machine's; not for what only -p takes: safeguards and a client's
+// cache marks (control requests and an extra body), a JSON schema, and
+// images. prompt is the run's first message.
+func claudeTUI(req *Request, binary claudeCLI, prompt []map[string]any) bool {
+	if !claudeTUIRuns || runtime.GOOS != "darwin" && runtime.GOOS != "linux" || binary.wsl != nil || binary.path == "" ||
+		len(req.Safeguards) > 0 || req.clientCache != nil || len(req.Format.schema()) > 0 ||
+		countImages(req.Messages) > 0 || settings.Load().ClaudePrintMode {
+		return false
+	}
+	b, _ := json.Marshal(prompt)
+	return len(b) <= tuiPromptMost
 }
 
 // safeguardBody is the safety-only form of the run's extra body.
@@ -1052,6 +1108,11 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 		return nil, nil
 	}
 	req.clientCache.selected(false)
+	if run.tui && (back != "" || countImages(since) > 0) {
+		// the interactive mode can't be taken back, nor pasted an image
+		run.abortFor("the interactive Claude Code can't go on with this turn")
+		return nil, nil
+	}
 	if back != "" {
 		if err := run.rewind(back); err != nil {
 			log.Printf("claude: a run that went on with a side question could not be taken back to the conversation's turn, let go: %v", err)
@@ -1103,6 +1164,12 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 	// untouched, where a run started anew is told it in one message, a
 	// prefix the cache has never seen
 	if req.Effort != run.effort {
+		if run.tui {
+			// the interactive mode takes its effort at its start only:
+			// the run is let go, and one at the new effort started
+			run.abortFor("its effort is set at its start, and the next turn asks another")
+			return nil, nil
+		}
 		if err := run.setEffort(req.Effort); err != nil {
 			run.abortFor("it could not be told the next turn's effort: " + err.Error())
 			return nil, nil
@@ -1763,7 +1830,8 @@ type controlReply struct {
 func (r *subscriptionRun) letGo() {
 	r.mu.Lock()
 	turn, back := r.turnUUID, r.backKey
-	can := !r.closed && r.stdin != nil && r.bridge != nil && r.timer != nil &&
+	// the interactive mode (claudeTUI) can't be taken back
+	can := !r.closed && !r.tui && r.stdin != nil && r.bridge != nil && r.timer != nil &&
 		turn != "" && back != "" && len(r.pending) == 0 && r.rewinding == nil
 	done := make(chan struct{})
 	if can {
@@ -2890,11 +2958,25 @@ const envElsewhereLeanNote = "\n\nThe environment these instructions describe (w
 // gateway's shell. It names no app and no vendor.
 const envUnknownNote = "\n\nThe environment given elsewhere in this conversation (its working directory, platform, OS and shell) is not the one the tools run on: don't take a platform, shell or path for a tool call from it."
 
+// envTurnsNote is envElsewhereNote, in either mode, for a caller whose
+// environment is in its messages, not its instructions (Claude Code
+// 2.1.296 and later, req.envInTurns). envElsewhereNote pointed the model
+// at instructions that describe no environment, while the caller's own
+// came after them as a message, and the gateway's Claude Code gave its
+// own before them all (packinggoods on Discord: a Mac client of a
+// Windows gateway still had commands wrapped in PowerShell). The run's
+// own environment is always the first one given, at the start of its
+// first message, and the caller's comes after it, so the last one given
+// is the caller's. It names no app and no vendor.
+const envTurnsNote = "\n\nOf the environments given in this conversation (working directory, platform, OS, shell, git status), the last one given is the one every tool runs in. Where an earlier one differs, go by the last; nothing has changed and there is no need to check."
+
 // envNote is what a run is told after the caller's instructions of where
 // its tools run: "" for a run in the caller's own folder, or for a caller
 // on this computer that names none.
 func envNote(req *Request) string {
 	switch {
+	case req.envElsewhere && req.envInTurns:
+		return envTurnsNote
 	case req.envElsewhere && req.leanPrompt:
 		return envElsewhereLeanNote
 	case req.envElsewhere:
@@ -3156,10 +3238,18 @@ func renderCachedParts(blocks []map[string]any, text *strings.Builder, parts []P
 		case Image:
 			blocks = imageBlocks(blocks, text, p)
 		}
-		if cached && p.cache != "" {
+		// A client block ends its rendered block even without a mark of its
+		// own: the mark a client put on this position last round has moved
+		// on with the conversation's growth, and with the boundary merged
+		// into the next marked block Anthropic's prefix check — which looks
+		// back over block boundaries, not into them — finds the old write
+		// no more and the whole history is written again (#3835)
+		if cached && (p.cache != "" || p.block) {
 			blocks = closeBlocks(blocks, text)
 			text.Reset()
-			blocks[len(blocks)-1]["cache_control"] = cacheMark(p.cache)
+			if p.cache != "" {
+				blocks[len(blocks)-1]["cache_control"] = cacheMark(p.cache)
+			}
 		}
 	}
 	return blocks
@@ -4469,6 +4559,13 @@ func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, from 
 	var err error
 	if name == "Claude Code" && wantsClientCache(r, from) {
 		req, err = parseAnthropicRequest(body, true)
+	} else if name == "Claude Code" && classifierClientCache(from, body) {
+		// the classifier never asked for its marks through magpie's
+		// header: a set the bridge can't keep (a TTL order Anthropic
+		// would refuse) goes the default way, as before, not refused
+		if req, err = parseAnthropicRequest(body, true); err != nil {
+			req, err = parse(from, body)
+		}
 	} else {
 		req, err = parse(from, body)
 	}

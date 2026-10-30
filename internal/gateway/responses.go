@@ -323,6 +323,12 @@ func parseResponses(body []byte) (*Request, error) { return readResponses(body, 
 // of raw values a parse kept would need. Run on every request, a long
 // Codex conversation's tool outputs were most of the parse (#3394).
 func readResponses(body []byte, facts bool) (*Request, error) {
+	return readResponsesFor(body, facts, false)
+}
+
+// readResponsesFor keeps instruction roles and positions on Responses-to-
+// Responses turns. Other APIs keep their existing system/cache mapping.
+func readResponsesFor(body []byte, facts, keepInstructions bool) (*Request, error) {
 	decode := decodeJSON
 	if facts {
 		decode = decodeJSONView
@@ -375,6 +381,10 @@ func readResponses(body []byte, facts bool) (*Request, error) {
 				var parts []Part
 				if !facts || role != "assistant" {
 					parts = responsesParts(it.Content)
+				}
+				if keepInstructions && (it.Role == "system" || it.Role == "developer") {
+					r.Messages = append(r.Messages, Message{Role: it.Role, Parts: parts})
+					continue
 				}
 				if (it.Role == "system" || it.Role == "developer") && replied {
 					// in place, told as the system's, not the user's words
@@ -890,13 +900,47 @@ func pairToolItems(body []byte) []byte {
 func mergeTurns(msgs []Message) []Message {
 	var out []Message
 	for _, m := range msgs {
-		if n := len(out); n > 0 && out[n-1].Role == m.Role {
+		if n := len(out); n > 0 && out[n-1].Role == m.Role && (m.Role == "user" || m.Role == "assistant") {
 			out[n-1].Parts = append(out[n-1].Parts, m.Parts...)
 			continue
 		}
 		out = append(out, m)
 	}
 	return out
+}
+
+// responseInstructions applies the existing cache-preserving mapping only
+// at an API that cannot keep native Responses instruction items.
+func responseInstructions(r *Request) *Request {
+	if !slices.ContainsFunc(r.Messages, func(m Message) bool { return m.Role == "system" || m.Role == "developer" }) {
+		return r
+	}
+	out := *r
+	out.Messages = nil
+	replied := false
+	for _, m := range r.Messages {
+		if m.Role == "assistant" || slices.ContainsFunc(m.Parts, func(p Part) bool {
+			return p.Kind == ToolCall || p.Kind == ToolResult || p.Kind == Thinking
+		}) {
+			replied = true
+		}
+		if m.Role == "system" || m.Role == "developer" {
+			if t := text(m.Parts); t != "" {
+				if replied {
+					out.Messages = append(out.Messages, Message{Role: "user", Parts: []Part{{Kind: Text, Text: "<system-reminder>\n" + t + "\n</system-reminder>"}}})
+				} else {
+					if out.System != "" {
+						out.System += "\n\n"
+					}
+					out.System += t
+				}
+			}
+			continue
+		}
+		out.Messages = append(out.Messages, m)
+	}
+	out.Messages = mergeTurns(out.Messages)
+	return &out
 }
 
 func responsesParts(raw json.RawMessage) []Part {
@@ -1437,6 +1481,84 @@ type responsesDecoder struct {
 	held    string          // its deltas since they made whole JSON, not given yet
 	whole   jsonWhole       // where its deltas stand in their JSON
 	full    string          // the open call's arguments as its done events give them
+	// waiting are the calls added but not given yet, in the order added;
+	// giving, while it lasts, is the call whose lines are being given
+	waiting []*rCall
+	giving  *rCall
+}
+
+// rCall is a function_call item added before its arguments came (#3985):
+// an upstream may add every call of a turn before any is argued, and a
+// start given then would close the call before it with none of its own.
+// Its lines are kept as they came and read when its own first arguments
+// or its item done arrives.
+type rCall struct {
+	itemID string
+	index  int      // the output_index its events name
+	lines  []string // its added, argument and item done lines
+	ended  bool     // its output_item.done came
+}
+
+// waitingCall is the call waiting whose item an event names, by item_id
+// or, when it names none waiting, by output_index. An event that names
+// nothing at all goes, while no call is open, to the first waiting one: a
+// stream whose events name nothing streams its calls in order. nil when
+// none is, and a delta naming no call waiting then goes on to the open
+// one as before, so a stream whose events name nothing still reads.
+func (d *responsesDecoder) waitingCall(itemID string, index *int) *rCall {
+	if itemID != "" {
+		for _, c := range d.waiting {
+			if c.itemID == itemID {
+				return c
+			}
+		}
+	}
+	if index != nil {
+		for _, c := range d.waiting {
+			if c.index == *index {
+				return c
+			}
+		}
+	}
+	if itemID == "" && index == nil && !d.calling && len(d.waiting) > 0 {
+		return d.waiting[0]
+	}
+	return nil
+}
+
+// give hands the client a waiting call: its lines as they came, read one
+// call at a time through the decoder as before. A call whose item hasn't
+// done is then the open one, the rest of its arguments going on as they
+// come.
+func (d *responsesDecoder) give(c *rCall, emit func(Event)) error {
+	d.waiting = slices.DeleteFunc(d.waiting, func(w *rCall) bool { return w == c })
+	d.giving = c
+	defer func() { d.giving = nil }()
+	for _, line := range c.lines {
+		if err := d.decode(line, emit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// giveWaiting gives the calls still waiting, in their items' order: every
+// one when the reply ends, else those whose items did while another call
+// was open.
+func (d *responsesDecoder) giveWaiting(all bool, emit func(Event)) error {
+	calls := slices.Clone(d.waiting)
+	slices.SortStableFunc(calls, func(a, b *rCall) int { return cmp.Compare(a.index, b.index) })
+	for _, c := range calls {
+		if all || c.ended {
+			if err := d.give(c, emit); err != nil {
+				return err
+			}
+		}
+	}
+	if all {
+		d.endCall(emit) // the last one given may still be open
+	}
+	return nil
 }
 
 // argsDelta gives an open call's argument delta, or holds it when with
@@ -1530,6 +1652,9 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		Type  string `json:"type"`
 		Delta string `json:"delta"`
 		Item  rItem  `json:"item"`
+		// the item an argument delta or done names, and where it sits
+		ItemID      string `json:"item_id"`
+		OutputIndex *int   `json:"output_index"`
 		// function_call_arguments.done's
 		Arguments string `json:"arguments"`
 		Response  struct {
@@ -1567,6 +1692,15 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 	case "response.output_item.added":
 		d.endCall(emit)
 		if ev.Item.Type == "function_call" {
+			if d.giving == nil {
+				// the call waits for its own arguments (#3985)
+				c := &rCall{itemID: ev.Item.ID, lines: []string{data}}
+				if ev.OutputIndex != nil {
+					c.index = *ev.OutputIndex
+				}
+				d.waiting = append(d.waiting, c)
+				return nil
+			}
 			d.called, d.calling = true, true
 			emit(Event{Kind: KToolStart, ID: ev.Item.CallID, Name: ev.Item.Name})
 		}
@@ -1581,21 +1715,55 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		d.endCall(emit)
 		emit(Event{Kind: KThink, Text: ev.Delta})
 	case "response.function_call_arguments.delta":
+		if d.giving == nil {
+			if c := d.waitingCall(ev.ItemID, ev.OutputIndex); c != nil {
+				c.lines = append(c.lines, data)
+				if d.calling {
+					return nil // the open call keeps its own; this one waits its turn
+				}
+				return d.give(c, emit)
+			}
+		}
 		if d.calling {
 			d.argsDelta(ev.Delta, emit)
 		} else {
 			emit(Event{Kind: KToolArgs, Text: ev.Delta})
 		}
 	case "response.function_call_arguments.done":
+		if d.giving == nil {
+			if c := d.waitingCall(ev.ItemID, ev.OutputIndex); c != nil {
+				c.lines = append(c.lines, data)
+				return nil
+			}
+		}
 		if d.calling && ev.Arguments != "" {
 			d.full = ev.Arguments
 		}
 	case "response.output_item.done":
 		if ev.Item.Type == "function_call" {
+			if d.giving == nil {
+				if c := d.waitingCall(ev.Item.ID, ev.OutputIndex); c != nil {
+					c.lines = append(c.lines, data)
+					c.ended = true
+					if d.calling {
+						return nil // it goes when the open call is done with its own
+					}
+					return d.give(c, emit)
+				}
+			}
 			if ev.Item.Arguments != "" {
 				d.full = string(ev.Item.Arguments)
 			}
 			d.endCall(emit)
+			// the calls whose items ended while the open one streamed go
+			// now — not while a call is being given, whose lines are still
+			// reading; those go when the reply ends
+			if d.giving == nil {
+				if err := d.giveWaiting(false, emit); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 		if ev.Item.Type == "reasoning" && ev.Item.EncryptedContent != "" {
 			// sealed: the item as the upstream wrote it, for a Responses
@@ -1632,6 +1800,10 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 			}
 			emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: code, Status: status, Said: said})
 			return nil
+		}
+		// the reply ends: every call still waiting goes before its stop
+		if err := d.giveWaiting(true, emit); err != nil {
+			return err
 		}
 		stop := "stop"
 		if ev.Response.Status == "incomplete" {

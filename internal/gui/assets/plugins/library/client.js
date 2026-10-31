@@ -90,11 +90,13 @@ magpie.plugin("library", (ctx) => {
     });
   }
 
-  // the hub's mark: magpie's bird, the one server each agent is given
-  // (the owner didn't like a made-up glyph for it)
+  // the hub's mark: magpie's bird, the one server each agent is given,
+  // its tail three lines out to three servers (the owner's pick, 10-31)
   function hubMark() {
     const g = el("span", "lib-glyph lib-hubmark");
-    g.innerHTML = '<svg viewBox="0 0 44 44" aria-hidden="true"><use href="#bird"/></svg>';
+    g.innerHTML = '<svg viewBox="0 0 44 44" aria-hidden="true"><use href="#bird" clip-path="url(#bird-notail)"/>'
+      + '<g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M13.5 24C9 21 7 15 4.5 9.5"/><path d="M13 25C9 24 6 21.5 3 19.5"/><path d="M12.5 26.2C9 27 6.5 28 4 29.5"/></g>'
+      + '<g fill="currentColor"><circle cx="4" cy="8.5" r="2.6"/><circle cx="2.8" cy="19.2" r="2.6"/><circle cx="3.6" cy="29.8" r="2.6"/></g></svg>';
     return g;
   }
   function glyph(d, cls = "lib-glyph") {
@@ -5108,7 +5110,11 @@ magpie.plugin("library", (ctx) => {
         const w = el("span", "who");
         w.append(el("span", "name", x.name), el("span", "sub", x.description || x.path || ""));
         r.append(cb, w);
-        if (x.have) r.append(tag(t("in the library"), ""));
+        // another skill from elsewhere has its name (mora1n on Discord):
+        // this one is in the library, or goes in beside it, by its own
+        if (x.have && x.as) r.append(tag(t("In the library as {name}", { name: x.as }), "lib-as", t("In the library as {name}", { name: x.as })));
+        else if (x.have) r.append(tag(t("in the library"), ""));
+        else if (x.as) r.append(tag(t("adds as {name}", { name: x.as }), "lib-as", t("The library has another skill called {name}, from elsewhere. This one goes in beside it as {as}.", { name: x.name, as: x.as })));
         list.append(r);
       }
     };
@@ -5886,7 +5892,10 @@ magpie.plugin("library", (ctx) => {
     ed.append(head);
     if (x.description) ed.append(el("p", "mk-about", about(x)));
     if (x.signIn) ed.append(el("p", "mk-hint", t("Each agent asks you to sign in, in the browser, the first time it uses it.")));
-    if (x.optIn) ed.append(el("p", "mk-hint", t("Pick the agents that may generate images: each image costs what the model set in Settings → Images charges.")));
+    if (x.name === "magpie-browser") {
+      ed.append(el("p", "mk-hint", t("Pick the agents that may use your browser: they act in your tabs, signed in as you are.")));
+      ed.append(browserSetup());
+    } else if (x.optIn) ed.append(el("p", "mk-hint", t("Pick the agents that may generate images: each image costs what the model set in Settings → Images charges.")));
     const firsts = [];
     for (const i of x.inputs || []) {
       const f = field2("", i.placeholder || (i.where === "env" ? i.key : ""), (v) => { values[i.key] = v.trim(); });
@@ -5923,6 +5932,46 @@ magpie.plugin("library", (ctx) => {
     modal = { save };
     openLib(ed);
     if (firsts.length) requestAnimationFrame(() => firsts[0].focus());
+  }
+
+  // Magpie Browser's extension: whether it is connected, and setting it up
+  // in the user's own browser, where their sign-ins are
+  function browserSetup() {
+    const box = el("div", "mk-browser");
+    const state = el("div", "mk-browser-state");
+    const steps = el("ol", "mk-browser-steps");
+    const go = button(t("Set up the extension…"), "action", async () => {
+      go.disabled = true;
+      try {
+        draw(await api("library/browser/setup", {}));
+        steps.hidden = false;
+      } catch (e) { status(e.message, "err"); }
+      go.disabled = false;
+    });
+    const draw = (b) => {
+      state.replaceChildren();
+      const dot = el("span", "mk-browser-dot" + (b.connected ? " on" : ""));
+      state.append(dot, el("span", "", b.connected
+        ? t("Connected to your browser") + (b.extension ? " · " + b.extension : "")
+        : b.written ? t("Not connected: load the folder below in your browser, and keep that browser open") : t("Not set up: set up the extension in Chrome, Edge, Arc, Brave or another Chromium browser")));
+      go.textContent = b.written ? t("Show the extension folder") : t("Set up the extension…");
+      steps.replaceChildren(
+        el("li", "", t("Open chrome://extensions (edge://extensions in Edge) in the browser you use every day.")),
+        el("li", "", t("Turn on Developer mode.")),
+        el("li", "", t("Click Load unpacked and choose {dir}.", { dir: tilde(b.dir) })),
+      );
+      if (b.connected) steps.hidden = true;
+      else if (b.written) steps.hidden = false;
+    };
+    steps.hidden = true;
+    box.append(state, steps, go);
+    const poll = async () => {
+      if (!box.isConnected) return;
+      try { draw(await api("library/browser")); } catch {}
+      setTimeout(poll, 3000);
+    };
+    requestAnimationFrame(poll);
+    return box;
   }
 
   function extLink(href, text) {

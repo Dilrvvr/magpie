@@ -27,6 +27,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
@@ -573,6 +574,28 @@ func load() file {
 	return f
 }
 
+// storedFile is load for a read that changes nothing, parsed once until the
+// file changes: the gateway asked for one provider's proxy (storedPicks)
+// and whether it is left alone (leftAlone) for each request and each
+// background look, each a parse of the whole file, 3.6 GB of a live
+// magpie's 33 GB in 53 minutes. What it returns is shared: the caller
+// must not change it, nor a list or map in it.
+func storedFile() file {
+	f, err := filememo.Read("providers", Path(), parseProviders)
+	if err != nil {
+		// missing, or a file that doesn't decode: read's own way, its
+		// last good generation
+		return load()
+	}
+	return f
+}
+
+func parseProviders(b []byte) (file, error) {
+	var f file
+	err := json.Unmarshal(bytes.TrimPrefix(b, utf8BOM), &f)
+	return f, err
+}
+
 // ErrUnreadable is a providers.json that is there but can't be read or
 // decoded: never an empty catalog, to list as none, back up or write over.
 var ErrUnreadable = errors.New("providers.json can't be read")
@@ -835,11 +858,14 @@ func withPicks(a, pk Provider) Provider {
 	return a
 }
 
-// Hidden lists the signed-in accounts the user removed from magpie.
+// Hidden lists the signed-in accounts the user removed from magpie. The
+// file is read once, as parsed until it changes: a parse of it for each
+// account was 68 MB of the Providers page's 1.4 GB in twenty loads.
 func Hidden() []Provider {
 	var out []Provider
+	saved := storedFile().Providers
 	for _, a := range Accounts() {
-		for _, p := range load().Providers {
+		for _, p := range saved {
 			if p.ID == a.ID && p.Hidden {
 				a.Quiet, a.Tucked = p.Quiet, p.Tucked
 				out = append(out, a)

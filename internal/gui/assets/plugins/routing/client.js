@@ -526,6 +526,7 @@ function routingPage(part) {
   const MODES = {
     "": ["Smart", "Smart: of the accounts with quota to spare, the one whose allowance renews soonest goes first — what it has left would be lost at the reset. The week decides; an account with five hours and no week goes by its five hours. One at 90% or more waits until the others can't answer; one resting after a failure goes last."],
     order: ["In order", "In order: the first answers everything until it can't; then the next."],
+    drain: ["Until used up", "Until used up: one answers everything until its quota is used up; then the next, which keeps them even after the one before renews."],
     rotate: ["In turn", "In turn: each conversation's next turn goes to the account after the one that answered its last, and a new conversation starts one further along; the requests within a turn stay put, keeping the prompt cache."],
     usage: ["Least used", "Least used first: the account with the most of its allowance left goes first; a key by the tokens magpie sent it lately."],
     pace: ["Weekly pace", "Weekly pace: the account with the most of its week left per hour until it renews goes first — the one with the most to lose at its reset; an account with five hours and no week by what its five hours have left per hour. One at 90% or more waits until the others can't answer; a key by the tokens magpie sent it lately."],
@@ -716,6 +717,7 @@ function routingPage(part) {
         : t("{name} has one key on — nothing to choose between.", { name: f.name });
     }
     if (f.rest) return t("Every one is resting after a failure, so {who}, first in line, is tried all the same.", { who: w });
+    if (f.creditsLast) return t("Every one here has used up its allowance and goes on on its credits, set to spend them only after everything else, so {who}, first in line, goes first.", { who: w });
     if (f.fallback) {
       const name = r.order.find((x) => !x.fallback)?.name || r.provider;
       return t("{name} is resting, so its fallback {fb} goes first.", { name, fb: `${f.provider}/${f.model}` });
@@ -739,6 +741,7 @@ function routingPage(part) {
       case "order": return rested.length
         ? t("In order: with {rested} resting after a failure, {who} is the first that can answer.", { rested: rested.join(", "), who: w })
         : t("In order: {who} is first, and answers everything while it can.", { who: w });
+      case "drain": return t("Until used up: {who} is the one in use, and answers everything until it is used up.", { who: w });
       case "rotate": return t("In turn: it's {who}'s turn — each request starts one further along.", { who: w });
       case "weight": return t(f.kind === "account" ? "By weight: it's {who}'s share — each account takes requests as its weight says." : "By weight: it's {who}'s share — each key takes requests as its weight says.", { who: w });
       case "free":
@@ -908,6 +911,11 @@ function routingPage(part) {
       // behind the first by a group's weights or its order, which take
       // each member whole: not by what x has left (Creat.wu: a group in
       // a group by weight, its accounts at 91%, read as passed over)
+      if (x.creditsLast && f0 && !f0.creditsLast) {
+        // behind everything not on its credits, as the user set it
+        out.push(t("{who} has used up its allowance and goes on on its credits, which it is set to spend only after everything else: it is tried after every other account, key and fallback.", { who: who(x) }));
+        continue;
+      }
       const by = !x.rest && !x.sunk && f0 ? memberSplit(r, f0, x) : null;
       if (by && smart(x) && (x.known ? group(x) === "low" : someKnown(x))) {
         if (!told.has(by.member)) {
@@ -927,7 +935,10 @@ function routingPage(part) {
       else if (smart(x) && !x.known && someKnown(x)) out.push(t("{who}: what it has left isn't known yet, so it goes after those known.", { who: who(x) }));
     }
     const pooled = r.order.find((x) => !x.aside && x.kind === "key");
-    for (const x of r.order.filter((x) => x.aside)) out.push(t("{who} is made for {api}, not {other} as the keys routed over are, so it isn't one of them: it's tried after them.", { who: who(x), api: API[x.speaks] || x.speaks || t("any API"), other: API[pooled?.speaks] || pooled?.speaks || t("any API") }));
+    // held back, the provider's accounts at once taken by those before it
+    // in the list (01huadalang on Discord, ZCode)
+    for (const x of r.order.filter((x) => x.reserve)) out.push(t("{who} is in reserve: {n} of its provider's accounts or keys take requests at once, the first in the list, so it's tried only once they have all failed.", { who: who(x), n: x.reserve }));
+    for (const x of r.order.filter((x) => x.aside && !x.reserve)) out.push(t("{who} is made for {api}, not {other} as the keys routed over are, so it isn't one of them: it's tried after them.", { who: who(x), api: API[x.speaks] || x.speaks || t("any API"), other: API[pooled?.speaks] || pooled?.speaks || t("any API") }));
     for (const x of r.left || []) out.push(leftWhy(x));
     return out;
   }
@@ -954,9 +965,12 @@ function routingPage(part) {
     switch (a.why) {
       case "resting": return t("{who} answered this conversation last, but it is resting, so the conversation moves.", { who: last });
       case "spent": return t("{who} answered this conversation last, but its allowance is all but used up, so the conversation moves.", { who: last });
+      case "reserve": return t("{who} answered this conversation last, but it is in reserve while those before it in the list can take requests, so the conversation moves back to them.", { who: last });
+      case "credits": return t("{who} answered this conversation last, but it is on its credits now, set to spend them only after everything else, so the conversation moves to {first}.", { who: last, first: who(r.order[0]) });
       case "gone": return t("{who} answered this conversation last, but it is no longer one to route to.", { who: last });
       case "order": return t("{who} answered this conversation last, but the group goes in order and {first}, ahead of it, is ready again, so turn {n} goes back to {first}.", { who: last, first: who(r.order[0]), n: a.turn });
       case "main": return t("{who}, a fallback, answered this conversation last, but the provider's own {first} is ready again, so turn {n} goes back to it.", { who: last, first: who(r.order[0]), n: a.turn });
+      case "back": return t("{who} took this conversation while {first}, listed ahead of it in the group, couldn't; {first} is ready again, so turn {n} goes back to it.", { who: last, first: who(r.order[0]), n: a.turn });
       case "no-cache": return t("{who} answered this conversation last, but the vendor then read only {r} tokens of it from its cache and wrote {w} — not worth staying for.", { who: last, r: tokens(a.cacheRead || 0), w: tokens(a.cacheWrite || 0) });
       case "cold": return t("{who} answered this conversation {d} ago, longer than the 5 minutes a vendor keeps a prompt cached — so routing decides afresh.", { who: last, d: ago });
       case "off": return t("Affinity is off: each request is routed afresh, whoever answered its conversation before.");
@@ -2609,6 +2623,7 @@ function routingPage(part) {
       else if (gave.has(id)) s = t("{status} · {fail} · passed to {agent}", { status: gave.get(id).status, fail: failWord(gave.get(id).fail), agent: agentName(r.agent) });
       else if (went.has(id)) s = t("{status} · {fail} · went on to the next", { status: went.get(id).status, fail: failWord(went.get(id).fail) });
       else if (w.noURL) s = noURLWord(w);
+      else if (w.reserve) s = t("in reserve · {n} at once", { n: w.reserve });
       else if (w.sunk && !lifted(sunkKey(w), at(w.sunk))) s = t("rate limited at {time} · at the back", { time: clock(w.sunk) });
       // the row smart routing's intent put first says the intent instead
       else if (said) s = said;
@@ -2619,7 +2634,8 @@ function routingPage(part) {
       else if (w.free) s = t("free · costs nothing");
       else if (w.known) {
         const soon = usedRenews(w);
-        s = !w.routing && w.used >= 98 && w.credits ? quota(w, "{n} used · on credits", "{n} left · on credits")
+        s = w.creditsLast && !r.order[0]?.creditsLast ? quota(w, "{n} used · on credits · after the others", "{n} left · on credits · after the others")
+          : !w.routing && w.used >= 98 && w.credits ? quota(w, "{n} used · on credits", "{n} left · on credits")
           : !w.routing && w.used >= 98 ? quota(w, "{n} used · all but used up", "{n} left · all but used up")
           : !w.routing && w.used >= 90 ? quota(w, "{n} used · kept for last", "{n} left · kept for last")
           : (b = behindWhy(r, w)) === "kept" ? quota(w, "{n} used · conversation kept on another", "{n} left · conversation kept on another")
@@ -2630,6 +2646,14 @@ function routingPage(part) {
       else if (w.aside) s = t("{api} only · after the others", { api: API[w.speaks] || w.speaks || t("any API") });
       else if (w.speaks) s = t("{api} only", { api: API[w.speaks] || w.speaks });
       else s = w.kind === "key" ? t("API key") : t("one key");
+      // when a known allowance renews stays on its row whatever the row is
+      // doing (dzxx0496 on Discord): answering, kept for last, passed over.
+      // A resting row says when it is back instead, a free one has nothing
+      // to renew, and a row that says it already isn't told twice.
+      if (!resting && !w.unlisted && w.known && !w.free) {
+        const soon = usedRenews(w), renew = soon > n ? t("renews in {d}", { d: dur(soon - n) }) : "";
+        if (renew && !s.includes(renew)) s += " · " + renew;
+      }
       // the title in a span of its own, one line cut short however the
       // status wraps on a narrow stage (routing.css .ses)
       const line = s + (named ? " · " : "");
@@ -5034,7 +5058,7 @@ function routingPage(part) {
   // after the requests: a request picked in the list plays on the stage,
   // so the list sits right under it
   more.append(gsec);
-  const ROUTE_OPTS = [["", "Smart"], ["order", "In order"], ["rotate", "In turn"], ["usage", "Least used"], ["pace", "Weekly pace"], ["free", "Free first"], ["fast", "Speed first"]];
+  const ROUTE_OPTS = [["", "Smart"], ["order", "In order"], ["drain", "Until used up"], ["rotate", "In turn"], ["usage", "Least used"], ["pace", "Weekly pace"], ["free", "Free first"], ["fast", "Speed first"]];
   // a group may also be routed by hand: every request to the member the
   // user picks on its card (provider.Manual, #317) — a provider's keys can't
   // and by its members' weights, as a provider's keys are (#1910)
@@ -5075,6 +5099,7 @@ function routingPage(part) {
   const GROUP_HINT = {
     "": "Smart, over the members' accounts and keys together: of the subscriptions with quota to spare, the one whose allowance renews soonest goes first — the week decides, and an account with five hours and no week (Claude Enterprise) goes by its five hours, so ahead of every week renewing later; one resting after a failure goes last.",
     order: "In order: the first model until it can't answer, then the next — each over its own accounts or keys as its provider routes them.",
+    drain: "Until used up: one account or key, across the members, takes every request until it is used up; then the next in the list, which keeps them even after an earlier one renews. One rate limited or failing is passed over only while it rests.",
     rotate: "In turn: each conversation's next turn goes to the next member's account or key, spreading the load.",
     usage: "Least used first: the account or key with the most of its allowance left goes first.",
     pace: "Weekly pace: the account with the most of its week left per hour until it renews goes first, so less of each member's week is lost at its reset — an account with five hours and no week (Claude Enterprise) by what its five hours have left per hour until they renew, so almost always first; a key by the tokens magpie sent it lately.",

@@ -3119,6 +3119,11 @@ function dragListen(handle, move, finish) {
   return () => { for (const [t, n, f, o] of on) t.removeEventListener(n, f, o); };
 }
 
+// A tap-to-click on a trackpad can slide a few pixels between the press and
+// the lift. A press let go within 300ms and under 12px from where it came down
+// is a click, not a drag, though it crossed the 4px that lifts a row.
+const tapLike = (t0, x0, y0, ev) => ev?.type === "pointerup" && performance.now() - t0 < 300 && Math.hypot(ev.clientX - x0, ev.clientY - y0) < 12;
+
 // Shared pointer sorter: transforms each frame, one commit on release. Rows are
 // placed each frame by the list's top, as what's above it changes (yuancjun)
 function dragRows(e, handle, row, list, rows, commit, start = () => {}, idle = () => {}) {
@@ -3129,7 +3134,7 @@ function dragRows(e, handle, row, list, rows, commit, start = () => {}, idle = (
   const lift = rows[0].getBoundingClientRect().top - base() - rows[0].offsetTop, grab = e.clientY - row.getBoundingClientRect().top;
   const { scroll, speedAt } = dragScroll(list);
   let dragging = false, ended = false, to = from, y = e.clientY, frame = 0, lastTime = 0;
-  const y0 = y, pointer = e.pointerId;
+  const y0 = y, x0 = e.clientX, t0 = performance.now(), pointer = e.pointerId;
   const paint = (time) => {
     frame = 0;
     if (!rows.every((r) => r.isConnected)) return finish(false);
@@ -3177,6 +3182,7 @@ function dragRows(e, handle, row, list, rows, commit, start = () => {}, idle = (
   };
   const finish = (save, ev) => {
     if (ended || (ev?.pointerId != null && ev.pointerId !== pointer)) return;
+    if (save && dragging && tapLike(t0, x0, y0, ev)) { save = false; delete handle.dataset.dragged; }
     if (save && dragging && ev) {
       y = ev.clientY;
       cancelAnimationFrame(frame);
@@ -3192,7 +3198,8 @@ function dragRows(e, handle, row, list, rows, commit, start = () => {}, idle = (
     rows.forEach((r) => { r.style.transform = ""; });
     if (save && dragging && to !== from) commit(to);
     idle();
-    // The click dispatched after pointerup must not rename, toggle or remove.
+    // The click dispatched after pointerup must not rename, toggle or remove
+    // (a tap-like press lets it through).
     setTimeout(() => delete handle.dataset.dragged, 0);
   };
   const off = dragListen(handle, move, finish);
@@ -3209,7 +3216,7 @@ function dragCards(e, handle, card, list, cards, commit, idle = () => {}) {
   const rects = cards.map((c) => c.getBoundingClientRect());
   const { scroll, scroll0, speedAt } = dragScroll(list);
   let dragging = false, ended = false, to = from, x = e.clientX, y = e.clientY, frame = 0, lastTime = 0;
-  const x0 = x, y0 = y, pointer = e.pointerId;
+  const x0 = x, y0 = y, t0 = performance.now(), pointer = e.pointerId;
   const r0 = rects[from];
   const paint = (time) => {
     frame = 0;
@@ -3253,6 +3260,7 @@ function dragCards(e, handle, card, list, cards, commit, idle = () => {}) {
   };
   const finish = (save, ev) => {
     if (ended || (ev?.pointerId != null && ev.pointerId !== pointer)) return;
+    if (save && dragging && tapLike(t0, x0, y0, ev)) { save = false; delete handle.dataset.dragged; }
     if (save && dragging && ev) {
       x = ev.clientX;
       y = ev.clientY;
@@ -5217,10 +5225,14 @@ function namedFree(...names) {
   return names.some((n) => /(^|[^a-z])free($|[^a-z])/i.test(n || ""));
 }
 
+// freeWhy: why a model is free: its plan's word, its provider's $0 price
+// (provider.PricedFree, jiangguochao666 on X) or its name
+const freeWhy = (plan, zero) => t(plan ? "free: it doesn't use the plan's credits" : zero ? "free: listed at $0 on this provider" : "free: so its name says");
+
 // freeBadge: the green FREE by a model, and why it is free
-function freeBadge(plan) {
+function freeBadge(plan, zero) {
   const f = el("span", "badge free", t("free"));
-  f.title = t(plan ? "free: it doesn't use the plan's credits" : "free: so its name says");
+  f.title = freeWhy(plan, zero);
   return f;
 }
 
@@ -5393,7 +5405,7 @@ function renderList() {
     words.append(el("span", "v", own ? t(o.label || o.value) : o.label || o.value));
     const tell = tellTag(o.tell);
     if (tell) words.append(tell);
-    if (o.free || (pick.modelPicker && o.value && namedFree(o.value, o.label))) words.append(freeBadge(o.free));
+    if (o.free || o.zero || (pick.modelPicker && o.value && namedFree(o.value, o.label))) words.append(freeBadge(o.free, o.zero));
     const rate = rateTag(o.rate, o.rateWas);
     if (rate) words.append(rate);
     const ctx = contextTag(o.context, o.label);
@@ -6814,8 +6826,9 @@ function segsPlace(box) {
 // on a new button. Down and up were on two buttons, so the browser sent the
 // click to neither and nothing was picked. Let go on the same option of the
 // same control, the new one is clicked; let go anywhere else (dragged off
-// to another option), nothing is, as for any button. A tap is left to the
-// browser, which clicks what is under the finger as it lifts.
+// to another option), nothing is, as for any button. A touch tap is left to
+// the browser, which clicks what is under the finger as it lifts; a mouse or
+// trackpad tap that slid off its option within tapLike's bounds still picks it.
 let segsPress = null;
 const optAt = (b) => [...b.parentElement.querySelectorAll(":scope > .opt")].indexOf(b);
 // the same control is at the same place, among as many of its kind, in rows
@@ -6830,15 +6843,25 @@ function segsWho(box) {
 }
 addEventListener("pointerdown", (e) => {
   const b = e.isPrimary && e.button === 0 && e.pointerType !== "touch" && e.target.closest?.(".segs > .opt");
-  segsPress = b ? { b, who: segsWho(b.parentElement), i: optAt(b) } : null;
+  segsPress = b ? { b, who: segsWho(b.parentElement), i: optAt(b), t: performance.now(), x: e.clientX, y: e.clientY } : null;
 }, true);
 addEventListener("pointercancel", () => { segsPress = null; }, true);
 addEventListener("pointerup", (e) => {
   const p = segsPress;
   segsPress = null;
-  if (!p?.who || p.b.isConnected || !e.isPrimary) return;
-  const b = document.elementFromPoint(e.clientX, e.clientY)?.closest(".segs > .opt");
-  if (!b || segsWho(b.parentElement) !== p.who || optAt(b) !== p.i) return;
+  if (!p?.who || !e.isPrimary) return;
+  let b;
+  if (p.b.isConnected) {
+    // a tap that slid off its option (a trackpad's tap lifts a few pixels
+    // from where it came down, refeccd's first press of Form | JSON): the
+    // browser clicks neither, or their common holder. A tap is the press
+    // let go soon and near, as tapLike has it; a drag off it is not.
+    if (p.b.contains(e.target) || !tapLike(p.t, p.x, p.y, e)) return;
+    b = p.b;
+  } else {
+    b = document.elementFromPoint(e.clientX, e.clientY)?.closest(".segs > .opt");
+    if (!b || segsWho(b.parentElement) !== p.who || optAt(b) !== p.i) return;
+  }
   // after the browser's own click, should one come to it after all
   let clicked = false;
   const seen = (c) => { if (b.contains(c.target)) clicked = true; };
@@ -11177,8 +11200,8 @@ function renderModels(p) {
       const tell = tellTag(tells.get(m.id));
       if (tell) c.append(tell);
       // one the plan serves at no cost to it (WorkBuddy's x0.00 credits)
-      // or one its vendor names free (#185)
-      const free = m.free || namedFree(m.id, m.name);
+      // or one its vendor names free (#185), or lists at $0
+      const free = m.free || m.zero || namedFree(m.id, m.name);
       if (free) c.append(el("span", "badge free", t("free")));
       const rate = rateTag(m.rate, m.rateWas);
       if (rate) c.append(rate);
@@ -11194,7 +11217,7 @@ function renderModels(p) {
       }
       if (m.default) c.title = `${m.id} · ${m.default}`;
       else if (m.name && m.name !== m.id) c.title = m.id;
-      if (free) c.title = (c.title || m.id) + " · " + t(m.free ? "free: it doesn't use the plan's credits" : "free: so its name says");
+      if (free) c.title = (c.title || m.id) + " · " + freeWhy(m.free, m.zero);
       if (noAPI(m)) c.title = (c.title || m.id) + "\n" + t("{p} has no URL for the API its list serves it on ({apis}), so agents aren't offered it. Add that URL, or set the API it is asked on in Names, prices & levels.", { p: p.name, apis: (apiNow(m.id) ? [apiNow(m.id)] : m.auto || []).map(apiLabel).join(" · ") });
       if (served.has(m.id)) c.title = (c.title || m.id) + "\n" + t(draft.unlisted ? "Routing groups use it: none are picked, so the vendor's list is used" : "Agents see it: none are picked, so the vendor's list is used") + "\n" + t("Click to pick just this model");
       else if (on && draft.unlisted && !decideOnly(p)) c.title = (c.title || m.id) + "\n" + t("Picked: the routing groups it is in use it. Agents don't see it.");
@@ -11687,7 +11710,7 @@ function renderModels(p) {
   // just the free ones (Discord: 是否可以支持只选择免费模型), offered only
   // when the list has both free and paid models: with none free it would
   // pick nothing, with all free it is Select all
-  const isFree = (m) => m.free || namedFree(m.id, m.name);
+  const isFree = (m) => m.free || m.zero || namedFree(m.id, m.name);
   if (p.models.some(isFree) && !p.models.every(isFree)) {
     const freeOn = el("button", "text action", t("Free only"));
     freeOn.title = t("Pick only the free models (those the filter shows), unpicking the others");
@@ -23365,12 +23388,18 @@ $("#sync").onclick = async () => {
   }
 };
 $("#open").onclick = () => api("window/main", {});
+$("#openMain").onclick = () => api("window/main", {});
+// the app says which edge of the placed panel is nearest the tray
+// (panelside.go); that edge alone opens the main window
+window.magpiePanelOpenAt = (side) => {
+  if (mode === "panel" && (side === "head" || side === "foot")) document.body.dataset.openAt = side;
+};
 $("#quit").onclick = () => api("window/quit", {});
 $("#winclose").onclick = () => winRuntime.then((w) => w?.Window.Close()); // hides it: the tray stays
 $(".top").addEventListener("dblclick", (e) => {
   if (document.body.classList.contains("linux") && !e.target.closest("button, nav")) winRuntime.then((w) => w?.Window.ToggleMaximise());
 });
-if (mode === "window") { $("#open").remove(); $("#quit").remove(); }
+if (mode === "window") { $("#open").remove(); $("#openMain").remove(); $("#quit").remove(); }
 else { $("#nav").remove(); $("#side").remove(); }
 if (mode !== "window" || !document.body.classList.contains("linux")) $("#winclose").remove();
 

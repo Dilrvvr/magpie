@@ -1236,6 +1236,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				writeJSON(rw, map[string]any{
 					"requestBody": c.RequestBody, "responseBody": c.ResponseBody,
 					"requestTruncated": c.RequestTruncated, "responseTruncated": c.ResponseTruncated,
+					// the headers both ways, the client's and each upstream
+					// request's, masked (usrname1833 on Discord)
+					"headers": c.Headers(),
 				})
 				return
 			}
@@ -1460,6 +1463,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// it follow the account's cap
 			Cap    int    `json:"cap"`
 			Window string `json:"window"`
+			// Windows, for windowcap, in place of Window: a family's
+			// windows, which the GUI shows as one meter
+			Windows []string `json:"windows"`
 			// Weight, for accountweight: the account's share under By
 			// weight routing, 1 to provider.MaxKeyWeight (0 or 1: none)
 			Weight int `json:"weight"`
@@ -1796,6 +1802,11 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				if !in.PromptAsWritten && old != nil {
 					in.PromptAsWritten = old.PromptAsWritten
 				}
+				// and that magpie filled the Gemini URL in once, which the
+				// form doesn't send: a URL cleared in it stays cleared
+				if !in.GeminiFilled && old != nil {
+					in.GeminiFilled = old.GeminiFilled
+				}
 				// and additional_tools taken, set with `magpie provider
 				// set <id> additional-tools=on` (#2660)
 				if !in.AdditionalTools && old != nil {
@@ -2060,7 +2071,10 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				return
 			}
 		case "windowcap":
-			if err := provider.SetWindowCap(in.ID, req.Account, req.Window, req.Cap); err != nil {
+			if len(req.Windows) == 0 {
+				req.Windows = []string{req.Window}
+			}
+			if err := provider.SetWindowCaps(in.ID, req.Account, req.Windows, req.Cap); err != nil {
 				fail(rw, err)
 				return
 			}

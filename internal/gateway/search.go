@@ -147,6 +147,17 @@ func codeAssistSearches(p provider.Provider, proto provider.Protocol, model stri
 	return proto == provider.CodeAssist && googleAccount(p) && searchModel(model)
 }
 
+// geminiKeySearches is a provider asked with a key at Google AI Studio's
+// Gemini API, the Google Gemini preset's beside its OpenAI-compatible one
+// (provider.AIStudioGemini; cocoasoda on Discord): Gemini runs googleSearch
+// there for a request that declares no function, as on Code Assist. One
+// that does — Codex's every turn, Claude Code's — is given magpie's search,
+// which the provider answers itself (searchesOwn), so the searches spend
+// the user's own Gemini API credit. No other vendor's API is read as one.
+func geminiKeySearches(p provider.Provider) bool {
+	return p.Account == nil && !p.IsPlugin() && !p.IsVertex() && searchesItself(p, provider.Gemini)
+}
+
 // searchModel is a model Code Assist runs googleSearch for: Gemini's, not
 // Claude's or GPT-OSS's on Antigravity, nor an image model.
 func searchModel(model string) bool {
@@ -157,6 +168,9 @@ func searchModel(model string) bool {
 // searchesFor is searchesItself for one request: a Google sign-in's Gemini
 // searches by itself only for a request without function tools.
 func searchesFor(p provider.Provider, proto provider.Protocol, model string, req *Request) bool {
+	if proto == provider.Gemini && geminiKeySearches(p) {
+		return searchModel(model) && (len(req.Tools) == 0 || req.ToolChoice == "none")
+	}
 	if searchesModel(p, proto, model) {
 		return true
 	}
@@ -325,8 +339,9 @@ func searchRank(p provider.Provider) int {
 		return 4
 	case partSearcher(p) && slices.ContainsFunc(p.Available(), func(m catalog.Model) bool { return searchesAlone(p, m.ID) }):
 		return 4
-	case googleAccount(p):
-		// Gemini on a Google sign-in, by googleSearch (#757)
+	case googleAccount(p), geminiKeySearches(p):
+		// Gemini on a Google sign-in (#757) or an AI Studio key
+		// (cocoasoda on Discord), by googleSearch
 		return 5
 	case remoteSearchesAny(p):
 		// another magpie, with the models it searches natively for
@@ -459,7 +474,7 @@ func Searchers() []SearcherChoice {
 		if len(ms) == 0 {
 			continue
 		}
-		out = append(out, SearcherChoice{Provider: p, Small: searcherModel(p), Models: ms, rank: r, ManualOnly: manualOnly, Own: googleAccount(p)})
+		out = append(out, SearcherChoice{Provider: p, Small: searcherModel(p), Models: ms, rank: r, ManualOnly: manualOnly, Own: googleAccount(p) || geminiKeySearches(p)})
 	}
 	slices.SortStableFunc(out, func(a, b SearcherChoice) int { return cmp.Compare(a.rank, b.rank) })
 	return out
@@ -494,8 +509,8 @@ type SearcherChoice struct {
 	// Service is a Kimi Code plan, which searches by its search service,
 	// with no model (and no Small or Models)
 	Service bool
-	// Own is a Google sign-in, whose Gemini searches for the provider's
-	// own models first, whoever is named (ownSearcher)
+	// Own is a Google sign-in or an AI Studio key, whose Gemini searches
+	// for the provider's own models first, whoever is named (ownSearcher)
 	Own bool
 }
 
@@ -675,7 +690,7 @@ func searcherReady(p provider.Provider) (string, bool) {
 	// what searchableModel says of a model is the model's and the
 	// provider's list's, which keptSmallCands is kept by
 	var keep func(catalog.Model) bool
-	if googleAccount(p) || p.IsRemoteMagpie() || partSearcher(p) {
+	if googleAccount(p) || geminiKeySearches(p) || p.IsRemoteMagpie() || partSearcher(p) {
 		keep = func(m catalog.Model) bool { return searchableModel(p, m.ID) }
 	}
 	c, ready := smallReadyOf(p, keptSmallCands(p, "search", keep), provider.Anthropic)
@@ -771,10 +786,16 @@ const searchersInTurn = 3
 // modelSearch searches the web with the searcher's model; one magpie
 // picked that fails or finds nothing gives way to the next searcher magpie
 // would pick, all of them within searchWaitMost. One Settings names gives
-// way to none: the search APIs, when set up, search in its place
-// (webSearch), and Settings says it didn't search (SearcherFailed). Handed
-// on, a search for Grok, picked, went to Codex's gpt-6-astra, a pricier
-// model the user hadn't picked, on every search (Gearclickist on Discord).
+// way to those named after it (SearcherThen), and, when it can't serve at
+// all — out of its allowance, refused for its quota, credit or rate
+// (errCantServe) — to the searchers magpie would pick in turn: a Codex
+// account named to search for Cursor's models, used up, broke every
+// search of the turns Cursor took over from it (pedestrianz, plugins#635).
+// One that answered without searching or found nothing gives way to no
+// other: the search APIs, when set up, search in its place (webSearch),
+// and Settings says it didn't search (SearcherFailed). Handed on, a search
+// for Grok, picked, went to Codex's gpt-6-astra, a pricier model the user
+// hadn't picked, on every search (Gearclickist on Discord).
 func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, error) {
 	p, model, ok := searcher()
 	if !ok {
@@ -782,12 +803,12 @@ func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, 
 	}
 	ctx, cancel := sideDeadline(context.WithValue(ctx, searchingKey{}, true), "search", searchTimeout, searchWaitMost)
 	defer cancel()
-	type pick struct{ id, model string }
-	tried := []pick{{p.ID, model}}
+	tried := []searchPick{{p.ID, model}}
 	var said string
 	var hits []Hit
 	// one magpie picked that is out of its allowance isn't asked: it
-	// would only be refused again (#1801); one the Settings name is
+	// would only be refused again (#1801); one the Settings name is, and
+	// its refusal, as one out of its allowance, hands it on (errCantServe)
 	err := searcherSpent(p, model)
 	cp, _, why := chosenSearcher()
 	named := why == "" && cp != nil && cp.ID == p.ID
@@ -799,7 +820,7 @@ func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, 
 	}
 	if named {
 		// those Settings names after it, in their order (SearcherThen),
-		// and no other
+		// then, when it can't serve, those magpie would pick
 		instead, first := "", err
 		if err != nil && ctx.Err() == nil {
 			for _, v := range settings.Load().SearcherThen {
@@ -811,12 +832,23 @@ func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, 
 					ctx = searchingInstead(ctx, p, model, first)
 				}
 				instead = searcherOf(*q, m)
+				tried = append(tried, searchPick{q.ID, m})
 				var next error
 				if said, hits, next = s.searchBy(ctx, *q, m, query, searchEffort(*q, m)); next == nil {
 					err = nil
 					break
 				}
 				err = errors.Join(err, next)
+			}
+			if err != nil && errors.Is(first, errCantServe) && ctx.Err() == nil {
+				if instead == "" {
+					ctx = searchingInstead(ctx, p, model, first)
+				}
+				var by string
+				said, hits, by, err = s.searchInTurn(ctx, query, tried, err, len(tried)+searchersInTurn-1)
+				if err == nil {
+					instead = by
+				}
 			}
 			if err == nil {
 				// what Settings says is the first's failure, and who
@@ -834,14 +866,32 @@ func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, 
 			namedFailed(p, model, first, "")
 		}
 		if err != nil {
-			if len(settings.Load().SearcherThen) > 0 {
+			switch {
+			case errors.Is(first, errCantServe):
+				return "", nil, fmt.Errorf("%w (no other provider could search in its place)", err)
+			case len(settings.Load().SearcherThen) > 0:
 				return "", nil, fmt.Errorf("%w (the searchers picked in Settings › Web search, in their order: no other provider searches in their place)", err)
 			}
 			return "", nil, fmt.Errorf("%w (the searcher picked in Settings › Web search: no other provider searches in its place)", err)
 		}
 		return said, hits, nil
 	}
-	// the others in turn, those with allowance left first
+	if err != nil && ctx.Err() == nil {
+		ctx = searchingInstead(ctx, p, model, err)
+		said, hits, _, err = s.searchInTurn(ctx, query, tried, err, searchersInTurn)
+	}
+	return said, hits, err
+}
+
+// searchPick is a searcher a search was asked of.
+type searchPick struct{ id, model string }
+
+// searchInTurn asks the searchers magpie would pick (Searchers), those
+// with allowance left first, of a provider not tried yet, until one
+// searches or most have been tried in all: what it found, and which
+// searched (searcherOf). err is the failures so far, which the new ones
+// join.
+func (s *Server) searchInTurn(ctx context.Context, query string, tried []searchPick, err error, most int) (string, []Hit, string, error) {
 	var turn, spent []SearcherChoice
 	for _, c := range Searchers() {
 		if c.ManualOnly || c.Small == "" {
@@ -854,28 +904,37 @@ func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, 
 		}
 	}
 	for _, c := range append(turn, spent...) {
-		if err == nil || ctx.Err() != nil || len(tried) >= searchersInTurn {
+		if ctx.Err() != nil || len(tried) >= most {
 			break
 		}
-		if slices.ContainsFunc(tried, func(t pick) bool { return t.id == c.Provider.ID }) {
+		if slices.ContainsFunc(tried, func(t searchPick) bool { return t.id == c.Provider.ID }) {
 			continue
 		}
-		if len(tried) == 1 {
-			ctx = searchingInstead(ctx, p, model, err)
-		}
-		tried = append(tried, pick{c.Provider.ID, c.Small})
+		tried = append(tried, searchPick{c.Provider.ID, c.Small})
 		next := searcherSpent(c.Provider, c.Small)
 		if next == nil {
-			said, hits, next = s.searchWith(ctx, c.Provider, c.Small, query, searchEffort(c.Provider, c.Small))
+			var said string
+			var hits []Hit
+			if said, hits, next = s.searchWith(ctx, c.Provider, c.Small, query, searchEffort(c.Provider, c.Small)); next == nil {
+				return said, hits, searcherOf(c.Provider, c.Small), nil
+			}
 		}
-		if next != nil {
-			err = errors.Join(err, next)
-		} else {
-			err = nil
-		}
+		err = errors.Join(err, next)
 	}
-	return said, hits, err
+	return "", nil, "", err
 }
+
+// errCantServe is a searcher that can't serve a search now: every account
+// or key of it out of its allowance (searcherSpent), or the search refused
+// for its quota, credit or rate (searchWith). It is the provider's state,
+// not what it does with a search, so another searches in its place.
+var errCantServe = errors.New("can't search now")
+
+// cantServe is err, a searcher's own error, said to be errCantServe
+// without changing what it says.
+type cantServe struct{ error }
+
+func (c cantServe) Unwrap() []error { return []error{c.error, errCantServe} }
 
 // lastNamedFail is the last search the searcher Settings names didn't
 // make, for Settings to say (SearcherFailed); cleared when it searches.
@@ -956,7 +1015,7 @@ func searcherSpent(p provider.Provider, model string) error {
 	if !back.IsZero() {
 		when = " until " + heldClock(back, time.Now())
 	}
-	return fmt.Errorf("%s/%s: out of its allowance%s, not asked", p.ID, model, when)
+	return cantServe{fmt.Errorf("%s/%s: out of its allowance%s, not asked", p.ID, model, when)}
 }
 
 // searchingInstead is ctx with its web search's CallFor saying that the
@@ -1036,7 +1095,12 @@ func (s *Server) searchWith(ctx context.Context, p provider.Provider, model, que
 		if t, ok := sideTimeout(ctx); ok {
 			msg = t.Error()
 		}
-		return "", nil, fmt.Errorf("%s/%s: %s", p.ID, model, msg)
+		err := fmt.Errorf("%s/%s: %s", p.ID, model, msg)
+		switch failure(w.Code, w.Body.Bytes()) {
+		case failQuota, failCredit, failRate:
+			err = cantServe{err}
+		}
+		return "", nil, err
 	}
 	var text strings.Builder
 	var sources []string

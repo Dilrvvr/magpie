@@ -99,6 +99,10 @@ type Provider struct {
 	// under it, with the key in x-goog-api-key, and models under it lists
 	// them (#1346).
 	Gemini string `json:"gemini,omitempty"`
+	// GeminiFilled is that magpie filled Gemini in once, for a provider
+	// at AI Studio's OpenAI-compatible URL (aiStudioNative): a Gemini URL
+	// the user cleared after that stays empty.
+	GeminiFilled bool `json:"geminiFilled,omitempty"`
 	// Decide is the base of a decision API (TypeSafe's System One, which
 	// Jev answers), for routing groups' choices of model and effort. The
 	// provider may also serve conversations on the other endpoints.
@@ -485,6 +489,15 @@ type Provider struct {
 	// up), and the user's picks came back with it no more. Every save keeps
 	// it but for what it picks again; Select none clears it.
 	Delisted []string `json:"delisted,omitempty"`
+	// DelistedAt is when the list left out the last pick still in Models,
+	// so that every pick is in Delisted: none is served until then and
+	// pickWait after it (waitsForPicks), and the list is served as if none
+	// were picked from then on. A vendor takes a model off for good too:
+	// WorkBuddy AI's free deepseek-v4.1-flash, a Free plan account's one
+	// pick, left its list for hy3, and the account was served none
+	// (maxleebeta on Discord). Zero, while some pick is still in Models, or
+	// for picks set aside before it was kept.
+	DelistedAt time.Time `json:"delistedAt,omitzero"`
 	// RefreshEvery, for a provider of the user's own, is how often the
 	// gateway fetches its model list by itself ("6h", "1d"; none, only when
 	// asked), as Fetch models does (#2135). See autolist.go.
@@ -858,7 +871,7 @@ func withPicks(a, pk Provider) Provider {
 // back but never written, and its rests out of quota and after failures
 // written but never read back.
 func accountSettings(a, pk Provider) Provider {
-	a.PickedFrom, a.Delisted = pk.PickedFrom, pk.Delisted
+	a.PickedFrom, a.Delisted, a.DelistedAt = pk.PickedFrom, pk.Delisted, pk.DelistedAt
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
 	a.SwitchOnly = pk.SwitchOnly
 	a.Sink, a.NoModels, a.BestInFamily = pk.Sink, pk.NoModels, pk.BestInFamily
@@ -1071,6 +1084,7 @@ func Save(p Provider) error {
 	}
 	p.PickedFrom = listedWith(p, was)
 	p.Delisted = delistedWith(p, was)
+	p.DelistedAt = delistedAtWith(p, was)
 	if was != nil {
 		if p.Was == nil {
 			p.Was = was.Was
@@ -1132,6 +1146,19 @@ func delistedWith(p Provider, was *Provider) []string {
 	return d
 }
 
+// delistedAtWith is what p.DelistedAt is saved as: zero while some pick is
+// in Models or none is set aside; else p's, or what was kept before when p
+// has none, as a save of another setting keeps the wait going.
+func delistedAtWith(p Provider, was *Provider) time.Time {
+	if len(p.Models) > 0 || len(p.Delisted) == 0 {
+		return time.Time{}
+	}
+	if p.DelistedAt.IsZero() && was != nil {
+		return was.DelistedAt
+	}
+	return p.DelistedAt
+}
+
 // listedWith is what p.PickedFrom is saved as: none without picks; what was
 // kept with the picks when they are the same picks; and the models listed
 // now when the picks are new, as the user picked them from that list. While
@@ -1140,17 +1167,24 @@ func delistedWith(p Provider, was *Provider) []string {
 // left unpicked isn't new when the list that left it out for a while has it
 // again (an Our Free Model channel not read yet when the picks were saved).
 // A list short of no pick is taken as it is: what it left out and lists
-// again later is new (TestClaudePicksOfEveryModelTakeOnesListedSince).
+// again later is new (TestClaudePicksOfEveryModelTakeOnesListedSince). A
+// provider of keys saved before PickedFrom was kept is given it at its next
+// Save, the same picks too, as withNewlyListed serves those picks as they
+// are until it has one (TestLegacyPicksOfEveryModelGetPickedFromAtSave).
 func listedWith(p Provider, was *Provider) []string {
 	if len(p.Models) == 0 {
 		return nil
 	}
-	if was != nil && slices.Equal(normalModels(was.Models), normalModels(p.Models)) {
+	same := was != nil && slices.Equal(normalModels(was.Models), normalModels(p.Models))
+	if same && was.PickedFrom != nil {
 		return was.PickedFrom
 	}
 	from := p
 	if q, err := Find(p.ID); err == nil {
 		from = *q // with its account, whose list it is
+	}
+	if same && (from.Account != nil || p.Account != nil) {
+		return was.PickedFrom // a subscription keeps the date rule
 	}
 	var ids []string
 	for _, m := range from.Available() {
@@ -1538,6 +1572,7 @@ func normalize(p Provider) Provider {
 		}
 	}
 	p.Gemini = GeminiBase(p.Gemini)
+	p.aiStudioNative()
 	// a pick whose URL is gone (cleared from the CLI) is no pick
 	if p.BaseAPI != "" && p.baseOf(p.BaseAPI) == "" {
 		p.BaseAPI = ""

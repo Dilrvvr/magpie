@@ -338,6 +338,7 @@ function routingPage(part) {
     e.classList.add(cls);
   };
   const tick = (e) => rerun(e, "tick", "rttick");
+  const tagFor = new WeakMap(); // a row's failure tag: the timer that takes it down
 
   // ---------- words ----------
 
@@ -409,7 +410,10 @@ function routingPage(part) {
   // A reply held back and let go in a burst at its end tells no speed
   // (usage.DecodeOf, John on Discord: Kimi Code at 2,237 tok/s): its
   // content came in under a quarter of its window (flow), or its answer
-  // at over 20 times the pace its reasoning came before its first text.
+  // at over 20 times the pace its reasoning came before its first text, or
+  // it came in under a second after a wait four times longer
+  // (pluviophile714 on Discord: gpt-6.1-sol, 392 tokens 0.25 s after an
+  // 8.2 s first token, read 1,539 tok/s; usage.HeldWindowMs).
   function decodeOf(r, ms, ttft, firstText, flow = r.flow, firstReasoning = r.firstReasoning, reasoningHidden = r.reasoningHidden) {
     if (reasoningHidden && !(firstText > 0)) return null;
     const think = reasoningOf(r), visible = think > 0 && !(firstText > 0) && firstReasoning >= ttft && flow > 0 && think <= r.out;
@@ -417,6 +421,7 @@ function routingPage(part) {
     const w = ms - from;
     if (!(n > 0 && ttft > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
     if (flow > 0 && flow * 4 < w) return null;
+    if (w < 1000 && from > 4 * w) return null;
     if (think > 0 && firstText > 0 && n * (firstText - ttft) > 20 * think * w) return null;
     return { n, w };
   }
@@ -2305,6 +2310,15 @@ function routingPage(part) {
     if (w.fallback) b.append(el("small", "fb", t("fallback")));
     const st = el("em"), bar = el("div", "bar"), bi = el("i"), tg = el("span", "tag");
     bar.append(bi);
+    // what the row says, cut short beside the model (routing.css), is read
+    // whole over it (yi_time on Discord). Measured as the pointer comes,
+    // not on each render: hundreds of rows (#3164)
+    st.onpointerenter = () => {
+      const cut = st.scrollWidth > st.clientWidth + 1;
+      if (cut) st.dataset.cut = "1"; else delete st.dataset.cut;
+      if (cut && !st.title) st.title = st.textContent;
+    };
+    st.onpointerleave = () => delete st.dataset.cut;
     li.append(el("i", "dot"), b, st, bar, tg);
     li.title = w.id;
     return { li, wire: path(), st, bi, tg, w };
@@ -2710,7 +2724,7 @@ function routingPage(part) {
       }
       // the intent and a session's title are the user's own words, of any
       // length: cut short on the row (routing.css), read whole over it
-      const full = said && s.includes(said) || named ? line + named : resting && !w.unlisted ? restTip(rest) : "";
+      const full = said && s.includes(said) || named ? line + named : resting && !w.unlisted ? restTip(rest) : row.st.dataset.cut ? s : "";
       if (row.st.title !== full) { if (full) row.st.title = full; else row.st.removeAttribute("title"); } // an empty title would hide the row's own
       // an account's windows each, with when they reset, in its tooltip
       // (#1835): the row says the fullest one while idle and what it is
@@ -3323,9 +3337,14 @@ function routingPage(part) {
   // or why the lead's pick stood
   function subagentWhy(r) {
     const agent = agentName(r.agent);
+    const said = { agent, model: r.subagent.asked, to: r.subagent.to, why: r.subagent.kept ? t(r.subagent.kept) : "" };
+    // set to follow the lead (cleverpigo on X): To is the lead's model
+    if (r.subagent.lead) return r.subagent.kept
+      ? t("{agent} requested a subagent on {model} and it stayed there: its subagents follow their lead, on {to}, but {why}.", said)
+      : t("{agent} requested a subagent on {model}; magpie put it on {to}, the model its lead is on.", said);
     return r.subagent.kept
-      ? t("{agent} requested a subagent on {model} and it stayed there: its subagents are set to {to}, but {why}.", { agent, model: r.subagent.asked, to: r.subagent.to, why: t(r.subagent.kept) })
-      : t("{agent} requested a subagent on {model}; magpie put it on {to}, the model set for its subagents.", { agent, model: r.subagent.asked, to: r.subagent.to });
+      ? t("{agent} requested a subagent on {model} and it stayed there: its subagents are set to {to}, but {why}.", said)
+      : t("{agent} requested a subagent on {model}; magpie put it on {to}, the model set for its subagents.", said);
   }
   // a request a stand-in of magpie's put on another model than it named
   // (Route.Moved): why, on its row's tag, its title and its story. Neo on
@@ -4598,9 +4617,18 @@ function routingPage(part) {
           tick(A.node);
           break;
         }
-        rerun(row.li, "hit", "rthit"); row.li.classList.add("tagged");
+        // the tag stands over the row's top edge, so the row is drawn whole
+        // (lift, routing.css) while it shows and as it fades: the shake's
+        // .hit ends at .45s, and with it the tag's top was cut for the rest
+        // of its 1.8s (yuancjun on Discord). A failure again on the row
+        // starts the 1.8s over
+        rerun(row.li, "hit", "rthit"); row.li.classList.add("tagged", "lift");
         row.tg.textContent = `${tr.status} · ${failWord(tr.fail)}`;
-        setTimeout(() => row.li.classList.remove("tagged"), 1800);
+        clearTimeout(tagFor.get(row.li));
+        tagFor.set(row.li, setTimeout(() => {
+          row.li.classList.remove("tagged");
+          tagFor.set(row.li, setTimeout(() => row.li.classList.remove("lift"), 300));
+        }, 1800));
         say(tryWhy(r, i));
         renderAll();
         dot.classList.add("back", "err");
@@ -5184,7 +5212,7 @@ function routingPage(part) {
   const LIST_OPTS = [["", "Its models too"], ["unlists", "The group alone"]];
   const LIST_HINT = {
     "": "Agents' model lists and the gateway's /v1/models show the group and each of its models.",
-    unlists: "Agents' model lists and the gateway's /v1/models show the group, not the models it names or its patterns match: they are used through it. A signed-in subscription's models stay in agents' lists. A request naming one is still answered.",
+    unlists: "Agents' model lists and the gateway's /v1/models show the group, not the models it names or its patterns match: they are used through it. Codex keeps its ChatGPT sign-in's own models. A request naming one is still answered.",
   };
   const SINK_HINT = {
     "": "One rate limited while it still has quota rests as long as the vendor asks, then takes its place in the order again.",
@@ -8089,7 +8117,10 @@ function routingPage(part) {
   // sight change #rt's height a fraction of a pixel, which WebKit reports
   // as a ResizeObserver loop (#3164)
   let stageAsked = 0;
-  new ResizeObserver(() => { if (!stageAsked) stageAsked = requestAnimationFrame(() => { stageAsked = 0; layout(); }); }).observe(stage);
+  // The agents' and magpie's columns are as wide as their words (routing.css),
+  // so a new name or address can move the cards while the stage keeps its size
+  const stageSeen = new ResizeObserver(() => { if (!stageAsked) stageAsked = requestAnimationFrame(() => { stageAsked = 0; layout(); }); });
+  for (const e of [stage, srcs, hub]) stageSeen.observe(e);
   // the list is as tall as leaves the stage in sight above it: the reader
   // scrolls the list, not the page, and a request picked plays in view.
   // Its top stays where it is as it is sized, so a row just clicked does too

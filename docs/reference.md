@@ -1157,6 +1157,43 @@ export const LemonPlugin = async () => ({
 In TypeScript, `icon` and `placeholder` aren't in OpenCode's types: build
 the hook as a variable (or cast it), or put the icon in `package.json`.
 
+#### Web search APIs from a plugin
+
+A plugin can add a web search API to Settings › Models › Web search with a
+`search` hook (magpie's own; OpenCode ignores it). It is listed after
+Tavily, Brave and the rest under its own name, and added, keyed, switched
+off, reordered and removed like them (`magpie search add <plugin>:<id> <key>`
+on the command line). magpie keeps its keys (several, tried in turn, a refused
+one resting), its order and its place in the request log, masks the query
+as it does for every search API, and asks the plugin only while the
+plugin is on and the Web search plugin is.
+
+```js
+export const MojeekSearch = async () => ({
+  search: {
+    mojeek: {                      // [a-z0-9-], at most 32; the API is `<plugin>:mojeek`
+      name: "Mojeek",              // its name in the list
+      keysURL: "https://www.mojeek.com/services/api/", // "Get a key" link, optional
+      keyOptional: false,          // true: it answers with no key
+      url: false,                  // true: the user gives its address (a SearXNG's)
+      async execute({ query, count, key, url }, ctx) {
+        const r = await fetch(`https://api.mojeek.com/search?fmt=json&q=${encodeURIComponent(query)}&t=${count}&api_key=${key}`, { signal: ctx.abort })
+        if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status }) // 401, 402, 403, 429 rest the key
+        const j = await r.json()
+        return j.response.results.map((x) => ({ title: x.title, url: x.url, text: x.desc }))
+      },
+    },
+  },
+})
+```
+
+`execute` returns `[{ title, url, text?, age? }]` (or `{ results: [...] }`);
+magpie strips tags and cuts each page's text. A throw with a numeric
+`status` (and `retryAfter`, its Retry-After) is the API refusing the key,
+treated as a built-in's 401/402/403/429 is; any other throw is a failure
+and the next search API is asked. It has the time a search API has
+(a quarter of a search's limit); `ctx.abort` fires then.
+
 #### Gateway middleware
 
 A plugin can also be gateway middleware: `onRequest(body, ctx)` sees each
@@ -2282,6 +2319,20 @@ is never written over: the square isn't shown while one is there, and on is
 refused. Claude Code runs a changed status line in its open sessions too,
 so nothing needs a restart. It is offered for Claude Code on this computer,
 not in a WSL distro. With the gateway not running it prints an empty line.
+
+Claude Code on another computer than magpie (magpie in Docker, on a server)
+can't be switched on from the square: magpie can't write that computer's
+settings.json, and the command would name a binary inside the container.
+`GET` or `POST /v1/magpie/statusline` answers the same line as plain text, so
+that computer needs only curl. The optional `?session=<id>` (or, in a POST,
+the `session_id` of the JSON Claude Code sends on stdin) adds the model like
+`/v1/magpie/route`, and `?only=` (comma separated, repeatable) keeps the
+accounts as `magpie statusline claude` does. A caller that isn't this
+computer needs a gateway key, a read-only one included (it gets the windows
+without the model); a key held to a budget, models or accounts sees only
+what it may. On the computer Claude Code runs on:
+`"statusLine": {"type": "command", "command": "curl -fsS -m 1 -H 'Authorization: Bearer <gateway key>' --data-binary @- http://<host>:3425/v1/magpie/statusline || true"}`.
+`magpie web` shows this command with its own address under Settings → About.
 
 `magpie heap [<file>]` is for a report of magpie holding too much memory: a
 macOS `sample` of the app shows Go's frames as `???`. It asks the running
@@ -3553,6 +3604,8 @@ The gateway and usage:
   page's history
 - `affinity.json` — which key or account answered each conversation, so a
   restart keeps it there while the vendor has it cached
+- `vision-cache.jsonl` — successful inline-image descriptions reused after a
+  restart (0600); `vision-cache.jsonl.lock` serializes writers during handover
 - `served.json` — when each account and key last answered
 - `quotas.json` — the last allowance each account reported
 - `quota-history.json`, `balance-history.json` — allowance and balance

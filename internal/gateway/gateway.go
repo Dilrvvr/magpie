@@ -527,10 +527,18 @@ type Server struct {
 	sockets clientSockets
 	// what it serves other computers TLS with, nil without (tls.go)
 	tls *tls.Config
-	// the images described for models that can't see them (vision.go)
-	sightMu    sync.Mutex
-	sights     map[string]*sight
-	sightOrder []string
+	// the images described for models that can't see them (vision.go);
+	// completed inline descriptions also survive a restart (vision_cache.go)
+	sightMu        sync.Mutex
+	sights         map[string]*sight
+	sightOrder     []string
+	sightFile      string
+	sightDiskLines int
+	// inline descriptions that may still have to save, from their creation
+	// until see has saved or given up; a shutdown lets the count reach zero
+	sightSaveMu    sync.Mutex
+	sightSaving    int
+	sightSavesIdle chan struct{} // closed while none may save
 	// blind are the models that turned an image away while this server
 	// ran, by "<provider>/<model>" (refuseSight): kept for the run alone,
 	// so a vendor that adds sight is asked again after a restart
@@ -558,7 +566,7 @@ type Server struct {
 // New makes a gateway.
 func New() *Server {
 	redact.SetKeyPath(filepath.Join(settings.Dir(), "redact.key"))
-	return &Server{
+	s := &Server{
 		// a request counted against a MaxRPM waits for room in its minute
 		// first (rpm.go); the ChatGPT backend is spoken to over HTTP/1.1
 		// (netproxy.HTTP1, which provider/codex_http1.go sets)
@@ -566,7 +574,10 @@ func New() *Server {
 		unfit:        make(map[string]bool),
 		subscription: newSubscriptionBridge(),
 		debug:        os.Getenv("MAGPIE_DEBUG") != "",
+		sightFile:    sightsPath(),
 	}
+	s.loadSights()
+	return s
 }
 
 // Recent lists the last calls, newest first.
@@ -868,6 +879,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			log.Printf("gateway: ending after %s with requests still in flight; they are cut (%v)", s.drainFor(), err)
 		}
 		<-sockets
+		// An inline description may still have to save after its request
+		// ended, or was canceled: wait for every such description to save or
+		// give up, rather than have the next start describe the images again.
+		if !s.waitSightSaves(c) {
+			log.Printf("gateway: ending before image descriptions could all be saved; the next start may describe them again")
+		}
 		s.subscription.abortAll()
 		provider.FlushServed() // what answered last, kept for the next start and the CLI
 		flushSticks()          // who answered which conversation, for the next start or the magpie handed over to
@@ -939,6 +956,8 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("POST "+provider.RemoteRefreshPath, s.quotaCardsRefresh)
 	mux.HandleFunc("POST "+provider.RemoteCodexResetPath, s.codexReset)
 	mux.HandleFunc("GET /v1/magpie/route", s.sessionRoute)
+	mux.HandleFunc("GET "+StatuslinePath, s.statusline)
+	mux.HandleFunc("POST "+StatuslinePath, s.statusline)
 	mux.HandleFunc("GET /v1/magpie/trace", s.gatewayTrace)
 	mux.HandleFunc("GET "+routeSnapshotPath, s.routeSnapshot)
 	mux.HandleFunc("GET "+routeEventsPath, s.routeEvents)
@@ -1056,7 +1075,7 @@ var catalogSize stamped[struct{}, int]
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"name": "magpie", "version": Version, "models": catalogSize.get(struct{}{}, func() int { return len(provider.Catalog()) }), "window": Window,
-		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", NativePath + "{provider}/{path}", "/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", "/v1/magpie/trace", OwnMCPPath, SearchMCPPath, VisionMCPPath, ImageMCPPath, BrowserMCPPath, ToolsMCPPath, HubMCPAll, HubMCPPath + "{agent}"}}
+		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", NativePath + "{provider}/{path}", "/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", StatuslinePath, "/v1/magpie/trace", OwnMCPPath, SearchMCPPath, VisionMCPPath, ImageMCPPath, BrowserMCPPath, ToolsMCPPath, HubMCPAll, HubMCPPath + "{agent}"}}
 	// which process serves, for another magpie on this computer to name it
 	// on its Routing page (#2606); not told to another machine
 	if local(r) {

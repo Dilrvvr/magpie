@@ -1011,6 +1011,8 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("GET "+GoroutinesPath, s.goroutineDump)
 	// a restart into the version magpie update put in (loopback only)
 	mux.HandleFunc("POST "+RestartPath, s.restartToUpdate)
+	// an update another magpie using this one asks for (a full-access key)
+	mux.HandleFunc("POST "+provider.RemoteUpdatePath, s.remoteUpdate)
 	mux.HandleFunc("GET /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("OPTIONS /v1/magpie/omarchy", s.omarchyTheme)
 	mux.HandleFunc("POST /v1/chat/completions", s.handle(provider.Chat))
@@ -2073,19 +2075,22 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 		// Codex with magpie as its provider asks for a thread's title
 		// here (#743)
 		if from == provider.Responses {
-			if to := codexTitlesTo(r.Header, body, true, nil); to != "" {
+			// on the conversation's model, not the one the app chose
+			// for it (codexSideTo)
+			session := func() string { return s.codexSideSession(r, body) }
+			if to := codexTitlesTo(r.Header, body, true, session); to != "" {
 				s.codexTitle(w, r, body, to)
 				return
 			}
-			if to := codexDescriptionsTo(r.Header, body, true, nil); to != "" {
+			if to := codexDescriptionsTo(r.Header, body, true, session); to != "" {
 				s.codexDescription(w, r, body, to)
 				return
 			}
-			if to := codexSummariesTo(r.Header, body, true, nil); to != "" {
+			if to := codexSummariesTo(r.Header, body, true, session); to != "" {
 				s.codexSummary(w, r, body, to)
 				return
 			}
-			if to := codexPredictionsTo(r.Header, body, true, nil); to != "" {
+			if to := codexPredictionsTo(r.Header, body, true, session); to != "" {
 				s.codexPrediction(w, r, body, to)
 				return
 			}
@@ -3433,8 +3438,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			hw.reloop = reloops < loopReasks && !pass
 		}
 		// a member of a group in the group is timed by the innermost
-		// group that sets a FirstToken (#2246), else by the group asked for
-		firstToken := cmp.Or(c.firstToken, g.FirstToken)
+		// group that sets a FirstToken (#2246), else by the group asked
+		// for, which follows the default for every group when it sets none
+		firstToken := c.firstToken
+		if firstToken == 0 && isGroup {
+			firstToken = g.FirstTokenOr()
+		}
 		if isGroup && firstToken > 0 && !last && streams && !pass {
 			// slow to start, the next member is asked (Group.FirstToken)
 			hw.firstWait = time.Duration(firstToken) * time.Second

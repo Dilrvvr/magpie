@@ -54,7 +54,7 @@ function routingPage(part) {
   if (!box) return;
   // the groups' way in where the header's row has no tab for them (markNav)
   const toGroups = $("#rtToGroups");
-  if (toGroups) toGroups.onclick = () => window.show("groups");
+  if (toGroups) toGroups.onclick = async () => { if (await window.show("groups")) openedFrom(toGroups); };
   const NS = "http://www.w3.org/2000/svg";
   const still = calm;
   const shown = () => !$("#view-routing").hidden && !document.hidden;
@@ -699,18 +699,32 @@ function routingPage(part) {
   // Without it (a route from before the gateway said so) only an account
   // of one window says when.
   const usedRenews = (w) => known0(w.usedRenews) ? at(w.usedRenews) : (w.renews || []).length === 1 ? renews(w)[0] : 0;
-  // renewsBy is renews as Smart ranks them: an auto-used Codex reset that
-  // starts the windows again sooner (restarts) is when they renew (#718),
-  // and the biggest windows that can't be used up before they renew any
-  // more (unreached: a month its weeks can't carry) rank it no more (#5639)
+  // renewsBy is renews as Smart ranks them, the gateway's own key (soon,
+  // Allowance.Renewal): a credit pack ending before its window resets
+  // renews then (#5646), an auto-used Codex reset that starts the windows
+  // again sooner (restarts) too (#718), and the biggest windows that
+  // can't be used up before they renew any more (unreached: a month its
+  // weeks can't carry) rank it no more (#5639). A route from before the
+  // gateway told soon is read from renews and restarts.
   const renewsBy = (w) => {
+    if (w.soon) return w.soon.slice(w.unreached || 0).map((s) => known0(s) ? at(s) : 0);
     const rs = known0(w.restarts) ? at(w.restarts) : 0;
     return renews(w).slice(w.unreached || 0).map((x) => rs && (!x || rs < x) ? rs : x);
   };
+  // lapseOf: when the soonest of its credits left are lost (Seat.Lapse),
+  // 0 when not told; expiresAt: its k-th window as ranked is that end
+  // rather than its reset, as its credits run out first
+  const lapseOf = (w) => known0(w.lapse) ? at(w.lapse) : 0;
+  const expiresAt = (w, k) => {
+    const H = 3600e3, x = renewsBy(w)[k], l = lapseOf(w);
+    return !!x && !!l && Math.floor(x / H) === Math.floor(l / H) && !known0(w.restarts);
+  };
 
-  // cmpRenews orders two accounts' windows as the gateway does: the
-  // biggest first, to the hour, one not known after those known. It says
-  // which window decided, too.
+  // cmpRenews orders two accounts as Smart does: their windows, the
+  // biggest first, to the hour, one not known after those known; then,
+  // renewing in the same hours, the one whose credits lapse first, one
+  // telling none after (routes.Smart). It says which window decided, k,
+  // or that the lapse did.
   function cmpRenews(a, b) {
     const ra = renewsBy(a), rb = renewsBy(b), H = 3600e3;
     for (let k = 0; k < ra.length || k < rb.length; k++) {
@@ -719,6 +733,8 @@ function routingPage(part) {
       if (!x || !y) return { c: x ? -1 : 1, k };
       return { c: x < y ? -1 : 1, k };
     }
+    const x = Math.floor(lapseOf(a) / H), y = Math.floor(lapseOf(b) / H);
+    if (x !== y) return { c: !x || !y ? (x ? -1 : 1) : x < y ? -1 : 1, k: -1, lapse: true };
     return { c: 0, k: -1 };
   }
 
@@ -935,14 +951,21 @@ function routingPage(part) {
     const next = peers.find((p) => p.known && group(p) === "fine");
     const soon = renewsBy(f).find(Boolean);
     if (!next) return t("{who} goes first: it has quota to spare, and the others are kept for last.", { who: w });
-    const { c, k } = cmpRenews(f, next);
+    const { c, k, lapse } = cmpRenews(f, next);
     if (c < 0 && k === 0 && known0(f.restarts)) return t("{who} goes first: of those with quota to spare, its allowance starts again soonest — one of its Codex resets about to run out is used by itself in {d}, and what it has left then is lost. {other} renews later and keeps its own.", { who: w, d: dur(at(f.restarts) - at(r.time)), other: who(next) });
+    // its credits run out before its window renews, and before the next
+    // one's does: Smart ranked it by that end (#5646)
+    if (c < 0 && k >= 0 && expiresAt(f, k)) return t("{who} goes first: its credits expire in {d}, before {other} renews, and what is left of them then is lost — so they're used first.", { who: w, d: dur(renewsBy(f)[k] - at(r.time)), other: who(next) });
     if (c < 0 && k === 0 && f.unreached) return t("{who} goes first: its longer window has more left than its shorter one can still let through before it renews, so the shorter one decides — it renews soonest, in {d}, and what it has left then is lost. {other} renews later and keeps its own.", { who: w, d: dur(renewsBy(f)[0] - at(r.time)), other: who(next) });
-    if (c < 0 && k === 0) return t("{who} goes first: of those with quota to spare, its allowance renews soonest — in {d} — and what it has left then is lost. {other} renews later and keeps its own.", { who: w, d: dur(renews(f)[0] - at(r.time)), other: who(next) });
-    if (c < 0) return t("{who} goes first: its allowance renews in the same hour as {other}'s, and its shorter one sooner — in {d}.", { who: w, other: who(next), d: dur(renewsBy(f)[k] - at(r.time)) });
+    if (c < 0 && k === 0) return t("{who} goes first: of those with quota to spare, its allowance renews soonest — in {d} — and what it has left then is lost. {other} renews later and keeps its own.", { who: w, d: dur(renewsBy(f)[0] - at(r.time)), other: who(next) });
+    if (c < 0 && k > 0) return t("{who} goes first: its allowance renews in the same hour as {other}'s, and its shorter one sooner — in {d}.", { who: w, other: who(next), d: dur(renewsBy(f)[k] - at(r.time)) });
+    // renewing in the same hour, its credits lapse first (Seat.Lapse)
+    if (c < 0 && lapse) return t("{who} goes first: it renews within the same hour as {other}, but its credits expire sooner — in {d} — so they're used first.", { who: w, other: who(next), d: dur(lapseOf(f) - at(r.time)) });
     if (c === 0 && walletWhy(r, f)) return walletWhy(r, f);
-    if (soon) return t("{who} and {other} renew within the same hour, so the order given stays — and the vendor's prompt cache stays warm.", { who: w, other: who(next) });
-    return t("{who} goes first, in the order given: when its allowance renews isn't known.", { who: w });
+    // the order given stands only where every key Smart sorts by ties
+    if (c === 0 && soon) return t("{who} and {other} renew within the same hour, so the order given stays — and the vendor's prompt cache stays warm.", { who: w, other: who(next) });
+    if (c === 0) return t("{who} goes first, in the order given: when its allowance renews isn't known.", { who: w });
+    return t("{who} goes first.", { who: w });
   }
 
   // behindWhy is why an account Smart weighed, with quota to spare, isn't
@@ -951,7 +974,8 @@ function routingPage(part) {
   // (demonyins on X: a Design Plan at 75% left, behind a Claude Max whose
   // week renewed sooner, read as paused): "kept" when the conversation
   // stays on the one that answered it, "sooner" when the first's allowance
-  // renews sooner (cmpRenews, as the gateway ranks them). null when it is
+  // renews sooner (cmpRenews, as the gateway ranks them), "expires" when
+  // the first's credits expire sooner, the key Smart went by (#5646). null when it is
   // first, or behind for what the row or another reason says already.
   function behindWhy(r, w) {
     const f = r.order[0], x = r.order.find((y) => y.id === w.id);
@@ -959,7 +983,8 @@ function routingPage(part) {
     if (!weighedWith(r, x).includes(f) || memberSplit(r, f, x)) return null;
     if (["session", "turn", "cache"].includes(r.affinity?.why)) return "kept";
     if (r.sealedTask || ruleWhy(r, true) || f.learns || !f.known || group(f) !== "fine" || f.useFirst && !x.useFirst) return null;
-    return cmpRenews(f, x).c < 0 ? "sooner" : null;
+    const { c, k, lapse } = cmpRenews(f, x);
+    return c >= 0 ? null : lapse || expiresAt(f, k) ? "expires" : "sooner";
   }
 
   // memberSplit: the group that put x behind f, when it is one that takes
@@ -1084,6 +1109,7 @@ function routingPage(part) {
       case "session": return t("Kept on {who}: it answered this conversation before, and affinity keeps a session with one account.", { who: last });
       case "turn": return t("Kept on {who}: {agent} is handing back tool results within turn {n}, and moving now would lose what the vendor cached of it.", { who: last, agent: agentName(r.agent), n: a.turn });
       case "cache": return t("Kept on {who}: {d} ago the vendor read {r} tokens of this conversation from its cache and wrote {w} to it; anyone else would be sent them afresh and paid in full.", { who: last, r: tokens(a.cacheRead || 0), w: tokens(a.cacheWrite || 0), d: ago });
+      case "lead": return t("Put on {first}, where this session's {model} is: one session goes on one account.", { first: who(r.order[0]), model: a.leadModel || "" });
       case "strict": return a.main ? t("{who}, a fallback, answered this conversation last. The provider's own {first} is ready again, but Stays is Strict, which never moves a conversation, so it stays on the fallback; new conversations go to {first}.", { who: last, first: who(a.main) }) : null;
       case "new-turn": return routing === "rotate"
         ? t("Turn {n} begins: in turn, it goes to the one after {who}, which answered the last turn — {next}.", { n: a.turn, who: last, next: who(r.order[0]) })
@@ -2766,6 +2792,8 @@ function routingPage(part) {
     // the page put itself back where the reader last left it
     const asked = window.scrollOnPurpose?.(e), opens = gView().hidden;
     if (opens && !(await window.show("groups"))) return;
+    // from Routing: its toolbar leads back to the request (gBack)
+    if (opens && e.target.closest?.("#view-routing")) openedFrom(e.target.closest(".rt-go"));
     if (asked) {
       readerScrolls(1000);
       row.scrollIntoView({ block: "center", behavior: opens || still() ? "auto" : "smooth" });
@@ -2897,6 +2925,7 @@ function routingPage(part) {
           : tiered(w) && group(w) === "low" ? quota(w, "{n} used · kept for last", "{n} left · kept for last")
           : (b = behindWhy(r, w)) === "kept" ? quota(w, "{n} used · conversation kept on another", "{n} left · conversation kept on another")
           : b === "sooner" && soon ? quota(w, "{n} used · renews in {d} · one renewing sooner goes first", "{n} left · renews in {d} · one renewing sooner goes first", { d: dur(soon - n) })
+          : b === "expires" && soon ? quota(w, "{n} used · renews in {d} · one whose credits expire sooner goes first", "{n} left · renews in {d} · one whose credits expire sooner goes first", { d: dur(soon - n) })
           : soon ? quota(w, "{n} used · renews in {d}", "{n} left · renews in {d}", { d: dur(soon - n) }) : quota(w, "{n} used", "{n} left");
       } else if (w.kind === "account") s = t("what's left not known yet");
       else if (w.routing === "usage") s = t("{n} tokens lately", { n: tokens(w.tokens || 0) });
@@ -3325,23 +3354,40 @@ function routingPage(part) {
   // #3953: a skipped OpenCode Zen Free's line had no logo, or another
   // member's), or both. Where two share the name at the same place (a key
   // called "API key" on two providers), the member the line is about wins,
-  // then an order member over a skipped one.
+  // then an order member over a skipped one. A line naming two that share
+  // the name (two accounts of one nickname on two providers: "A and A
+  // renew…", #5646) gives each further time it says that name the next
+  // of them, each with its own logo, so it doesn't read as one.
   function logoed(s, r, about) {
     const word = /[A-Za-z0-9_]/;
+    const apart = (i, n) => !word.test(s[i - 1] || "") && !word.test(s[i + n.length] || "");
+    const members = [...new Set([about, ...r.order, ...(r.left || [])].filter(Boolean))];
     let hit = null;
-    for (const w of new Set([about, ...r.order, ...(r.left || [])].filter(Boolean))) {
+    for (const w of members) {
       for (const n of new Set([who(w), w.name].filter(Boolean))) {
         for (let i = s.indexOf(n); i >= 0; i = s.indexOf(n, i + 1)) {
-          if (word.test(s[i - 1] || "") || word.test(s[i + n.length] || "")) continue;
+          if (!apart(i, n)) continue;
           if (!hit || i < hit.i || (i === hit.i && n.length > hit.n.length)) hit = { i, n, w };
           break;
         }
       }
     }
     if (!hit) return [s];
-    const name = el("span", "rt-named");
-    name.append(icon(logoOf(hit.w)), hit.n);
-    return [s.slice(0, hit.i), name, s.slice(hit.i + hit.n.length)].filter((x) => x !== "");
+    const hits = [hit], seen = new Set([hit.w.id]);
+    const alike = members.filter((w) => !seen.has(w.id) && who(w) === hit.n && (seen.add(w.id), true));
+    for (let i = s.indexOf(hit.n, hit.i + hit.n.length); i >= 0 && alike.length; i = s.indexOf(hit.n, i + hit.n.length)) {
+      if (apart(i, hit.n)) hits.push({ i, n: hit.n, w: alike.shift() });
+    }
+    const out = [];
+    let from = 0;
+    for (const h of hits) {
+      const name = el("span", "rt-named");
+      name.append(icon(logoOf(h.w)), h.n);
+      out.push(s.slice(from, h.i), name);
+      from = h.i + h.n.length;
+    }
+    out.push(s.slice(from));
+    return out.filter((x) => x !== "");
   }
 
   function renderSteps(r) {
@@ -5662,6 +5708,38 @@ function routingPage(part) {
   const gsec = el("div", "rt-gsec");
   const gHead = el("div", "row-head"), gList = el("div", "list rt-groups");
   const pHead = el("div", "row-head"), pList = el("div", "list rt-pools");
+  // the way back up to Routing, at the toolbar's leading edge as a Mac
+  // app's back button (unscientific9 on Discord: a request's group opened
+  // this page and nothing led back). Shown where the page was opened from
+  // Routing (gFrom: a request's group, Routing's own "Routing groups ›"),
+  // and always where the header has no tab of its own for it, Routing's
+  // tab standing for both (markNav); beside the sidebar, opened from its
+  // own tab, it is a page of its own and has none (routing.css). Escape
+  // does the same while nothing on the page is open to take it
+  let gFrom = null;
+  const gBack = el("button", "text rt-gback");
+  gBack.type = "button";
+  gBack.append("‹ ", el("span", "", t("Routing")));
+  gBack.onclick = () => groupsBack();
+  gHead.append(gBack);
+  async function groupsBack() {
+    const from = gFrom;
+    if (!(await window.show("routing"))) return;
+    // the request the reader came from, still on the page, has the keyboard
+    if (from?.isConnected) from.focus({ preventScroll: true });
+  }
+  const openedFrom = (from) => { gFrom = from || true; gView()?.classList.add("rt-gfrom"); };
+  new MutationObserver(() => {
+    if (!gView().hidden) return;
+    gFrom = null;
+    gView().classList.remove("rt-gfrom");
+  }).observe(gView(), { attributes: true, attributeFilter: ["hidden"] });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || e.defaultPrevented || e.repeat || !gShown() || !gBack.getClientRects().length) return;
+    if (gEdit || gImport || gSel || !$("#modal")?.hidden || e.target.closest?.("input, textarea, select, [contenteditable]")) return;
+    e.preventDefault();
+    groupsBack();
+  });
   // whether magpie finds groups on its own, by the list it fills (蓝猫 on
   // Discord: they could only be removed one at a time)
   const gFound = el("div", "rt-gfound");
@@ -6111,7 +6189,8 @@ function routingPage(part) {
     newBtn.append(svg(PLUS, 11, 1.8), el("span", "", t("New group")));
     newBtn.title = t("Make a routing group of any models you like — agents pick it as one model");
     newBtn.onclick = () => newGroup();
-    const head = [];
+    gBack.lastChild.textContent = t("Routing"); // in the language now
+    const head = [gBack];
     if (all.length > 1 || gQ.value) {
       gQ.placeholder = t("Filter groups and models");
       gQ.setAttribute("aria-label", gQ.placeholder);

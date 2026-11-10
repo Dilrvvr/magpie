@@ -54,6 +54,10 @@ func helpFor(args []string) string {
 		return quotaUsage
 	case "statusline":
 		return statuslineUsage
+	case "mtls":
+		return mtlsUsage
+	case "https":
+		return httpsUsage
 	case "heap":
 		return heapUsage
 	case "cpu":

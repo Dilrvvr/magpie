@@ -238,18 +238,53 @@ var Weekdays = []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
 // dayOrder is the week as a window shows it, Monday first.
 var dayOrder = []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 
-// clockMinutes reads "HH:MM" (or "H:MM") as minutes past midnight.
+// clockMinutes reads "HH:MM" (or "H:MM") as minutes past midnight. What a
+// phone's number pad or a Chinese keyboard types counts too, as the GUI's
+// clockOf reads it (MinglunZhu on X): "22", "2200", "930", "22：00",
+// "22.00", "22点", "22点30". "9:5" is no time.
 func clockMinutes(s string) (int, bool) {
-	h, m, ok := strings.Cut(strings.TrimSpace(s), ":")
-	if !ok || len(h) < 1 || len(h) > 2 || len(m) != 2 {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case r >= '０' && r <= '９':
+			b.WriteRune(r - '０' + '0')
+		case strings.ContainsRune(":：.．hH時时点點", r):
+			b.WriteByte(':')
+		case r == '分':
+		default:
+			b.WriteRune(r)
+		}
+	}
+	v := b.String()
+	h, m, ok := strings.Cut(v, ":")
+	if !ok && len(v) >= 3 {
+		h, m = v[:len(v)-2], v[len(v)-2:]
+	}
+	m = strings.TrimSpace(m)
+	if ok && m == "" {
+		m = "00"
+	}
+	if !ok && len(v) <= 2 {
+		m = "00"
+	}
+	if len(h) < 1 || len(h) > 2 || len(m) != 2 || !digits(h) || !digits(m) {
 		return 0, false
 	}
-	hh, err1 := strconv.Atoi(h)
-	mm, err2 := strconv.Atoi(m)
-	if err1 != nil || err2 != nil || hh < 0 || hh > 23 || mm < 0 || mm > 59 || h[0] == '+' || m[0] == '+' {
+	hh, _ := strconv.Atoi(h)
+	mm, _ := strconv.Atoi(m)
+	if hh > 23 || mm > 59 {
 		return 0, false
 	}
 	return hh*60 + mm, true
+}
+
+func digits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // ParseDay reads a day of the week, "mon" or "Monday", as Weekdays has it.
@@ -479,7 +514,7 @@ func cleanRules(rules []Rule, members []string) ([]Rule, error) {
 		case len([]rune(r.Intent)) > MaxIntent:
 			return nil, fmt.Errorf("rule %d: an intent is at most %d characters", n, MaxIntent)
 		case len(r.Conditions()) == 0:
-			return nil, fmt.Errorf("rule %d: it needs a condition (tokens, images, effort, agents, subagent, message, intent, compacting, time or folders)", n)
+			return nil, fmt.Errorf("rule %d: it needs a condition (tokens, images, effort, agents, subagent, message, system, last, intent, compacting, time or folders)", n)
 		case r.Pause && (r.Tokens > 0 || r.Images || r.Effort != "" || r.Intent != "" || r.Compact):
 			return nil, fmt.Errorf("rule %d: a pause holds by hours, days, agents or folders only", n)
 		}
@@ -517,15 +552,19 @@ type RuleRequest struct {
 	// be told.
 	Subagent bool
 	// Message is the user's own words at the turn's start, read only when
-	// a rule has a message condition (RulesReadMessage).
+	// a rule has a message condition (RulesRead).
 	Message string
+	// System is each block of the request's system prompt as the agent
+	// sent it, and Last each text of its last user message, read only
+	// when a rule has a system or last condition.
+	System, Last []string
 }
 
-// RulesReadMessage reports whether a rule of rules looks at the user's
-// message, which is then read for it.
-func RulesReadMessage(rules []Rule) bool {
+// RulesRead reports whether a rule of rules has a condition on field,
+// which is then read for it.
+func RulesRead(rules []Rule, field string) bool {
 	return slices.ContainsFunc(rules, func(r Rule) bool {
-		return slices.ContainsFunc(r.Where, func(c Cond) bool { return c.Field == "message" })
+		return slices.ContainsFunc(r.Where, func(c Cond) bool { return c.Field == field })
 	})
 }
 

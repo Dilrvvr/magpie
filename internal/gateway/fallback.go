@@ -537,6 +537,9 @@ func (s *Server) planPaused(p provider.Provider, model string, from provider.Pro
 		pl.order = append(pl.order, asideOf(aside, q, fallback, from)...)
 		cs = append(cs, aside...)
 		for _, c := range left {
+			if fallback && q.NoStandIn && !p.NoStandIn {
+				continue // no last resort for another's request either
+			}
 			w := weighed(c, q, weighing{}, fallback, from)
 			w.Unlisted = true
 			pl.left = append(pl.left, w)
@@ -579,16 +582,45 @@ func (s *Server) planPaused(p provider.Provider, model string, from provider.Pro
 		seen[fp.ID+"/"+fm] = true
 		out = append(out, add(fp, fm, true)...)
 	}
+	out, pl.order, pl.left, _ = standInsOut(out, pl.order, pl.left, !p.NoStandIn)
 	return restLast(out, pl)
 }
 
+// standInsOut leaves out, of cs in the order planned (before a failure
+// rests one or a rate limit sinks it, so a local model that is down still
+// counts as first), each key or account of a provider set never to take
+// another model's request (provider.NoStandIn) that comes after one of a
+// provider not so set, and says so on left (sonnnnnnnnnnnna on X: a local
+// uncensored model that fails must not hand its request to a vendor that
+// bans for it). other is true when the request went first to a provider
+// not so set, which may have nothing planned (its model off, its accounts
+// at their caps), and comes back true once one such was seen. order is
+// cs's rows, as restLast takes them.
+func standInsOut(cs []candidate, order, left []Weighed, other bool) ([]candidate, []Weighed, []Weighed, bool) {
+	keep := cs[:0:0]
+	kept := order[:0:0]
+	for i, c := range cs {
+		if !c.p.NoStandIn {
+			other = true
+		} else if other {
+			w := order[i]
+			w.StandIn, w.Unlisted = true, true
+			left = append(left, w)
+			continue
+		}
+		keep, kept = append(keep, c), append(kept, order[i])
+	}
+	return keep, append(kept, order[len(cs):]...), left, other
+}
+
 // groupsAfter is p with the routing groups the user built that have p's
-// model in them (provider.GroupsAfter) added after its own fallbacks,
-// those it has already left out; ok is false when there are none to add.
-func groupsAfter(p provider.Provider, model string) (provider.Provider, bool) {
+// model in them (provider.GroupsAfter), then also, added after its own
+// fallbacks, those it has already left out; ok is false when there are
+// none to add.
+func groupsAfter(p provider.Provider, model string, also ...string) (provider.Provider, bool) {
 	var add []string
-	for _, id := range provider.GroupsAfter(p.ID + "/" + model) {
-		if !slices.Contains(p.Fallback, id) {
+	for _, id := range append(provider.GroupsAfter(p.ID+"/"+model), also...) {
+		if !slices.Contains(p.Fallback, id) && !slices.Contains(add, id) {
 			add = append(add, id)
 		}
 	}
@@ -646,6 +678,11 @@ func (s *Server) planGroup(g provider.Group, ms []provider.Member, from provider
 	var asides []candidate
 	var wAsides []Weighed
 	out := planLevel(g, ms, 0, from, &pl, &asides, &wAsides, nil)
+	// a member never another's stand-in goes only where the group's
+	// first, or those before it, are so set too
+	var other bool
+	out, pl.order, pl.left, other = standInsOut(out, pl.order, pl.left, false)
+	asides, wAsides, pl.left, _ = standInsOut(asides, wAsides, pl.left, other)
 	if sinks(g.Sinks(), g.Routing) {
 		out, pl.order = sinkPlanned(out, pl.order)
 	}
@@ -1589,6 +1626,15 @@ var unservedWords = provider.ModelUnserved
 // and its other models are asked as before. A refusal that also says
 // quota, credit or a rate limit is about the account, and rests it.
 func modelRefused(status int, body []byte) bool {
+	if status >= 500 {
+		// a relay pooling accounts says why each refused it in the last
+		// one's words (poolLastError): when those are the model's, the
+		// model is what the relay can't serve, not the key
+		if m := poolLastError.FindSubmatch(wordsOf(body)); m != nil {
+			return modelRefused(http.StatusNotFound, m[1])
+		}
+		return false
+	}
 	if modelRetired(status, body) {
 		return true
 	}
@@ -1601,6 +1647,18 @@ func modelRefused(status int, body []byte) bool {
 	body = wordsOf(body)
 	return unservedWords.Match(body) && !quotaWords.Match(body) && !refusedWords.Match(body) && !zdrRefused(status, body)
 }
+
+// poolLastError is a relay that pools accounts (CLIProxyAPI) answering,
+// once every account it has for the model refused, its 503
+// "auth_unavailable: no auth available (providers=codex, model=gpt-6-sol;
+// last upstream error: model_not_found: The 'gpt-6-sol' model is not
+// supported when using Codex with a ChatGPT account.)" (Jray05343207 on
+// X): its accounts are ChatGPT plans that lack the model, which the relay
+// lists all the same. Read as the 503 it came with, it rested the whole
+// key as an outage, with every model on it, and another provider of the
+// model was never asked for it. The words after "last upstream error:"
+// are the refusal itself.
+var poolLastError = lazyre.New(`(?i)no auth available \(providers=[^;)"]*; last upstream error: ([^"\n]+)`)
 
 // codeAssistModelMissing says a Google account's Code Assist — the
 // Antigravity or Gemini CLI built-in's — answered 404 NOT_FOUND

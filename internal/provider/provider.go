@@ -29,6 +29,7 @@ import (
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -152,6 +153,16 @@ type Provider struct {
 	// always has (routes.Seat.Lead).
 	UseFirst bool `json:"useFirst,omitempty"`
 
+	// NoStandIn keeps another model's request off it (sonnnnnnnnnnnna on
+	// X): a request that went first to a provider not so marked, such as
+	// a local uncensored model that is down or out of room, is never sent
+	// on to it as a fallback or a routing group's next member, so text
+	// written for that model can't get a vendor's account banned. One
+	// that goes first to it, or to another provider so marked, still
+	// moves on as ever. Off, the default, it stands in for any. See
+	// gateway.standInsOut.
+	NoStandIn bool `json:"noStandIn,omitempty"`
+
 	// Affinity is how long a conversation stays with the key or account
 	// that answered it, so the vendor's prompt cache it filled is read
 	// again rather than lost (see Affinities): "" auto, "session",
@@ -271,6 +282,10 @@ type Provider struct {
 	// weighs it at nothing). Prices and the costs Usage counts stay as
 	// listed: it says what to spend first, not what a call cost.
 	CountFree bool `json:"countFree,omitempty"`
+	// Billing is the user's word on how the provider bills: BillingPlan
+	// or BillingPAYG (EV_John_Liu on X); "" has magpie read it
+	// (BillingKind). It only marks the provider on Providers and Routing.
+	Billing string `json:"billing,omitempty"`
 	// RateWindows are the time-of-day windows it bills at its own rate
 	// (#2463): a peak at 2× or 3×, a discount off peak. The first window
 	// that holds a call's time multiplies the price again, on top of
@@ -333,6 +348,15 @@ type Provider struct {
 	// once through DeepSeek's Files API, for a day, and the turns name it
 	// by its file id (gateway's deepseek_files.go, #5407).
 	ImageFilesOff bool `json:"imageFilesOff,omitempty"`
+
+	// UpstreamProviders, on a Remote magpie, `upstream-providers=on`, names each
+	// of its models in the agents' lists by the provider serving it on
+	// the other magpie, the first in a chain of them: "Claude Sonnet 5 ·
+	// Office › RelayA", whatever that magpie's own Provider in model names
+	// is, so one model from two of its providers is told apart here
+	// (lcc580 on X). Off, the default, names each as that magpie's list
+	// does. The ids stay as they are: office/relaya/claude-sonnet-5.
+	UpstreamProviders bool `json:"upstreamProviders,omitempty"`
 
 	// PromptAsWritten, on Antigravity's subscription, has the system prompt
 	// go to Google exactly as the agent wrote it. By default the few lines
@@ -460,6 +484,19 @@ type Provider struct {
 	// (TakesInsecureTLS), for the hosts of its own base URLs
 	// (UncheckedHosts); see Via.
 	HTTP1 bool `json:"http1,omitempty"`
+
+	// ClientCert and ClientKey are the PEM files of a client certificate
+	// magpie shows the provider's own HTTPS hosts when they ask for one,
+	// and ServerCA a PEM CA their certificate may be signed by beside the
+	// system's roots (#5596, clxsh, and hhdaxia on X: Remote magpie to a
+	// magpie at home behind an Nginx that requires a client certificate,
+	// or one with `magpie mtls` on). Only a provider the user added, and
+	// Remote magpie, takes them (TakesClientCert), for the hosts of its
+	// own base URLs (UncheckedHosts), on every request made for it:
+	// models, the connection test, requests, quotas; see Via.
+	ClientCert string `json:"clientCert,omitempty"`
+	ClientKey  string `json:"clientKey,omitempty"`
+	ServerCA   string `json:"serverCA,omitempty"`
 
 	// Proxy is the proxy magpie's requests to this provider go through
 	// (#237: Codex through one, a vendor at home without): "" follows
@@ -1047,6 +1084,7 @@ func accountSettings(a, pk Provider) Provider {
 	a.AccountCaps, a.AccountWindowCaps, a.AccountWindowAmounts = pk.AccountCaps, pk.AccountWindowCaps, pk.AccountWindowAmounts
 	a.CapStop, a.CapCareful = pk.CapStop, pk.CapCareful
 	a.UseFirst = pk.UseFirst
+	a.NoStandIn = pk.NoStandIn
 	a.AccountNames = pk.AccountNames
 	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
 	a.MaxAccounts = pk.MaxAccounts
@@ -1063,6 +1101,8 @@ func accountSettings(a, pk Provider) Provider {
 	a.PriceRate = pk.PriceRate
 	// counted free by the user's word, every account alike
 	a.CountFree = pk.CountFree
+	// and how it bills, by the user's word (BillingKind)
+	a.Billing = pk.Billing
 	// the hours the provider bills at its own rate (#2463), as the editor
 	// keeps them for the account like the rest of these
 	a.RateWindows = pk.RateWindows
@@ -1243,6 +1283,21 @@ func Save(p Provider) error {
 		}
 		if p.HTTP1 && !p.TakesInsecureTLS() {
 			return fmt.Errorf("%s is a preset's: only a provider you added with your own base URL can be held to HTTP/1.1", p.Name)
+		}
+		if p.ClientCert != "" || p.ClientKey != "" || p.ServerCA != "" {
+			if !p.TakesClientCert() {
+				return fmt.Errorf("%s: a client certificate or server CA is only for a provider you added with a base URL of its own, or Remote magpie", p.ID)
+			}
+			for _, f := range []*string{&p.ClientCert, &p.ClientKey, &p.ServerCA} {
+				v, err := CertPath(*f)
+				if err != nil {
+					return fmt.Errorf("%s: %w", p.ID, err)
+				}
+				*f = v
+			}
+			if err := netproxy.CheckClientCert(p.ClientCert, p.ClientKey, p.ServerCA); err != nil {
+				return fmt.Errorf("%s: %w", p.ID, err)
+			}
 		}
 		if strings.Contains(p.Decide, WorkspaceID) {
 			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
@@ -1477,7 +1532,11 @@ func AddCopy(p Provider, from string) (string, error) {
 	}
 	p.Searches = p.Searches || src.Searches
 	p.Unredacted = p.Unredacted || src.Unredacted
+	p.NoStandIn = p.NoStandIn || src.NoStandIn
 	p.CountFree = p.CountFree || src.CountFree
+	if p.Billing == "" {
+		p.Billing = src.Billing
+	}
 	p.NativeCompaction = p.NativeCompaction || src.NativeCompaction
 	if p.Socket == "" {
 		p.Socket = src.Socket

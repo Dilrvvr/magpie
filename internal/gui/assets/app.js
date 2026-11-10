@@ -6162,7 +6162,7 @@ function renderProviders(quiet) {
       const plan = accountPlan(p.account), bare = plan.startsWith(p.name + " ") ? plan.slice(p.name.length + 1) : "";
       key = el("span", "key acct acct-plan", bare && plan.length > 15 ? bare : plan);
       key.title = t("{agent} is signed in; its models are here for every other agent", { agent: p.account.agentName });
-    } else if (p.vertex) {
+    } else if (p.vertex && !p.key.set) {
       // Vertex AI signs with the user's Google credentials, never a key;
       // the pill says which: the service account it acts as, else the
       // credentials file, else Application Default Credentials (ADC)
@@ -9060,7 +9060,8 @@ function closeModal() {
 }
 // the providers page's dialog; the library and a confirmation that borrow it
 // ask the same of its backdrop
-const modalBackdrop = backdropClick($("#modal"));
+// the title bar strip (.modal-grip) is part of the backdrop: a click there closes too
+const modalBackdrop = backdropClick($("#modal"), (e) => e.target === e.currentTarget || e.target.classList.contains("modal-grip"));
 $("#modal").onclick = (e) => { if (modalBackdrop(e)) cancelEdit(); };
 
 // ---------- sliding thumb ----------
@@ -9173,16 +9174,26 @@ const VERTEX_EP_HINT = "Gemini generateContent — what Vertex AI serves at your
 // apiLabel: the name an API (a protocol) goes by in the editor
 const apiLabel = (proto) => (PROTOS.find(([k]) => k === proto) || [])[1] || proto;
 // vertexBase: a Vertex AI provider's address (provider.vertexBase), "" till its project is one
-function vertexBase(v) {
+// vertexRoot: the base URL typed as a root, as provider.vertexRootOf keeps it
+function vertexRoot(u) {
+  u = (u || "").trim().replace(/\/+$/, "");
+  if (!u) return "";
+  if (!u.includes("://")) u = "https://" + u;
+  return u.replace(/\/v1(?:beta1)?$/, "");
+}
+// with a key (keyed) the project is optional: express mode asks at the global endpoint, and a base URL stands in for Google's host
+function vertexBase(v, keyed) {
   const project = (v?.project || "").trim().toLowerCase(), loc = (v?.location || "").trim().toLowerCase() || "global";
+  const root = keyed ? vertexRoot(v?.baseUrl) : "";
+  if (!project) return keyed ? `${root || "https://aiplatform.googleapis.com"}/v1` : "";
   if (!/^[a-z0-9][a-z0-9.:-]*[a-z0-9]$/.test(project) || !/^[a-z]+(-[a-z0-9]+)*$/.test(loc)) return "";
   const host = loc === "global" ? "aiplatform.googleapis.com" : loc === "us" || loc === "eu" ? `aiplatform.${loc}.rep.googleapis.com` : `${loc}-aiplatform.googleapis.com`;
-  return `https://${host}/v1/projects/${project}/locations/${loc}`;
+  return `${root || "https://" + host}/v1/projects/${project}/locations/${loc}`;
 }
 // vertexOfDraft is the editor's Vertex AI fields as a Save sends them
 function vertexOfDraft() {
   const v = draft.vertex || {};
-  return { project: (v.project || "").trim(), location: (v.location || "").trim(), credentials: (v.credentials || "").trim(), impersonate: (v.impersonate || "").trim() };
+  return { project: (v.project || "").trim(), location: (v.location || "").trim(), credentials: (v.credentials || "").trim(), impersonate: (v.impersonate || "").trim(), baseUrl: (v.baseUrl || "").trim() };
 }
 const decideOnly = (p) => !!p?.decide && !(p.chat || p.responses || p.anthropic || p.gemini);
 // OpenRouter lists its decision models apart
@@ -9225,7 +9236,7 @@ function duplicateProvider(p) {
   const d = draftOf(p);
   draft = { ...d, id: slug(name), name, chosen: [], extra: d.chosen, copyOf: p.id };
   if (p.zhipuTeam) draft.zhipuTeam = { org: p.zhipuTeam.org || "", project: p.zhipuTeam.project || "" };
-  if (p.vertex) draft.vertex = { project: p.vertex.project || "", location: p.vertex.location || "", credentials: p.vertex.credentials || "", impersonate: p.vertex.impersonate || "" };
+  if (p.vertex) draft.vertex = { project: p.vertex.project || "", location: p.vertex.location || "", credentials: p.vertex.credentials || "", impersonate: p.vertex.impersonate || "", baseUrl: p.vertex.baseUrl || "" };
   renderProviders();
 }
 
@@ -9686,8 +9697,11 @@ function drawEditor(p, presetID) {
   // Vertex AI: no key, the user's Google Cloud project's token
   const vertex = p ? !!p.vertex : !!pr?.vertex;
   let vertexProject = null;
-  if (vertex) draft.vertex = draft.vertex || { project: p?.vertex?.project || "", location: p?.vertex?.location || "", credentials: p?.vertex?.credentials || "", impersonate: p?.vertex?.impersonate || "" };
+  if (vertex) draft.vertex = draft.vertex || { project: p?.vertex?.project || "", location: p?.vertex?.location || "", credentials: p?.vertex?.credentials || "", impersonate: p?.vertex?.impersonate || "", baseUrl: p?.vertex?.baseUrl || "" };
   const vertexFields = () => {
+    // the address shown follows a key typed: with one the project is optional
+    const typedKey = key.oninput;
+    key.oninput = () => { typedKey(); refreshEndpoints(); };
     const box = (k, placeholder, cls) => {
       const i = input(draft.vertex[k], placeholder);
       i.classList.add(cls);
@@ -9701,6 +9715,8 @@ function drawEditor(p, presetID) {
       ...field(t("Location"), box("location", "global", "vertex-location"), t("global, us, eu or a region such as us-central1. Each location serves its own models; global serves them all.")),
       ...field(t("Credentials file"), box("credentials", "~/.config/gcloud/application_default_credentials.json", "vertex-credentials"), t("Optional. Left empty, gcloud's Application Default Credentials are used (gcloud auth application-default login), or the file GOOGLE_APPLICATION_CREDENTIALS names. A service account's key file works too.")),
       ...field(t("Service account"), box("impersonate", t("optional · a service account's email"), "vertex-impersonate"), t("Requests are then made as this service account, impersonated with the credentials above: their account needs roles/iam.serviceAccountTokenCreator on it.")),
+      ...(p?.keyList?.length ? [] : field(t("API key"), keyWrap, t("Instead of the above: a Vertex AI API key (express mode). Gemini models only, no project needed."))),
+      ...field(t("Base URL"), box("baseUrl", "https://aiplatform.googleapis.com", "vertex-base-url"), t("Only with an API key: where requests go in place of Google's address, such as a proxy.")),
     ];
   };
   if (addressField) ed.append(...addressField);
@@ -10077,7 +10093,7 @@ function drawEditor(p, presetID) {
       const src = { chat: draft.chat || base.chat || "", responses: draft.responses || base.responses || "", anthropic: draft.anthropic || base.anthropic || "", decide: (pr && !pr.decide ? draft.decide ?? base.decide : base.decide) || "" };
       // Vertex AI's, from its project and location, once one is typed
       if (vertex) {
-        src.gemini = vertexBase(draft.vertex);
+        src.gemini = vertexBase(draft.vertex, !!(draft.key || "").trim() || !!p?.key?.set);
         for (const x of row) x.hidden = !src.gemini;
       }
       Object.assign(src, address && movedURLs(draft));
@@ -10291,7 +10307,7 @@ function drawEditor(p, presetID) {
     if (isNew && custom && !body.name) { name.focus(); return editorError(t("Give it a name"), "warn"); }
     if (isNew && custom && !body.chat && !body.anthropic && !body.responses && !body.gemini && !body.decide) { url.focus(); return editorError(t("A base URL is needed"), "warn"); }
     if (endpoint && !body.chat && !body.responses) { endpoint.focus(); return editorError(t(pr.endpointNeeded || "Your resource's endpoint is needed"), "warn"); }
-    if (vertex && !body.vertex.project) { vertexProject?.focus(NO_SCROLL); return editorError(t("Google Vertex AI needs the id of your Google Cloud project"), "warn"); }
+    if (vertex && !body.vertex.project && !(draft.key || "").trim() && !p?.key?.set) { vertexProject?.focus(NO_SCROLL); return editorError(t("Google Vertex AI needs the id of your Google Cloud project"), "warn"); }
     if (address) {
       const a = (draft.address || "").trim();
       if (localAddress(a) === null) { address.focus(NO_SCROLL); return editorError(t("Address: {v} isn't an address like http://localhost:11434", { v: a }), "warn"); }
@@ -11011,7 +11027,7 @@ function detectAPIs(p, base, use) {
   const picked = () => p ? chosenIds() : (draft.extra || []).filter((id, i, all) => id && all.indexOf(id) === i);
   // no key typed, none saved and none copied: a refusal is likely the key
   const keyless = () => {
-    if ((draft.key || "").trim() || p?.key?.set || draft.vertex) return false;
+    if ((draft.key || "").trim() || p?.key?.set || (draft.vertex?.project || "").trim()) return false;
     const of = !p && draft.copyOf && providers.providers.find((x) => x.id === draft.copyOf);
     return !of?.key?.set;
   };
@@ -12907,13 +12923,14 @@ function copilotHostSwitch(sub) {
 
 // signAsk: a sign-in that asks one value first (Copilot's GHE.com host, a
 // Claude setup-token); its sheet is in signsheets.js, loaded when asked for
-async function signAsk(flow) {
-  try { await import("./signsheets.js"); } catch (err) { return statusErr(err); }
+async function signAsk(flow, sheet = "./signsheets.js") {
+  try { await import(sheet); } catch (err) { return statusErr(err); }
   stopSignIn();
   signing = flow;
   renderProviders();
 }
 const startClaudeToken = () => signAsk({ agent: "claude", state: "token", token: "" });
+const startExport = (agent) => signAsk({ agent, state: "export", format: "sub2api", off: new Set() }, "./acctexport.js");
 
 // dropSigningIn: an editor closing leaves no sign-in waiting (#526); an
 // import being read finishes.
@@ -12993,6 +13010,7 @@ function renderSigning(sub) {
   }
   if (signing.state === "ghe") return window.copilotGHESheet();
   if (signing.state === "token") return window.claudeTokenSheet();
+  if (signing.state === "export") return window.accountExportSheet(sub);
   if (signing.state === "import" || signing.state === "importing" || signing.state === "imported") return renderLoginImport(sub);
   if (signing.state === "method" || signing.state === "prompt" || signing.state === "key") return renderPluginAsk(sub);
   if (signing.state === "failed") {
@@ -13581,6 +13599,7 @@ function renderAccounts(a, p) {
       imp.title = importSay(a.agent).from;
       list.append(imp);
     }
+    if (sub.importable && (a.agent === "claude" || a.agent === "codex")) list.append(addRow(t("Export accounts to a file…"), () => startExport(a.agent)));
     if (a.agent === "claude") list.append(addRow(t("Add an account by setup-token…"), startClaudeToken));
   }
   arrangeAccountRows(list, p);
@@ -13841,6 +13860,8 @@ function quotaError(err, q) {
   if (/^couldn't reach chatgpt\.com for the usage read/.test(err)) return t("Couldn't reach ChatGPT — check the network or the proxy");
   if (/^ChatGPT's usage reply isn't one magpie reads/.test(err)) return t("ChatGPT answered in a form magpie doesn't read — hover for what it sent");
   if (/^a ChatGPT API account's usage isn't told through OpenAI's API/.test(err)) return t("OpenAI's API doesn't tell a ChatGPT API account's usage — see chatgpt.com/settings/usage, or add the account as ChatGPT to see it here");
+  // a switched-off subscription is not read (errLeftAlone, login_usage.go)
+  if (/^not read yet: this subscription is switched off/.test(err)) return t("Switched off, so no allowance is read — switch it on and refresh");
   const bal = balanceError(err);
   if (bal) return bal;
   // a plugin's own usage read failed: its first line (aqiu817/magpie-sensenova#1)
@@ -21107,6 +21128,7 @@ function renderAlerts(s, keep) {
   const turnOpts = [["0", t("Off")], ...mins.map((m) => [String(m * 60), t("{n} min", { n: m })])];
   if (d && !mins.some((m) => m * 60 === d)) turnOpts.push([String(d), d % 60 ? t("{n} s", { n: d }) : t("{n} min", { n: d / 60 })]);
   $("#turnDoneSegs").replaceChildren(segs(turnOpts, String(d), (v) => savePrefs({ ...keep, turnDoneAlert: Number(v) })));
+  window.barkPaint ? barkPaint(s) : import("./bark.js").then(() => barkPaint(prefs || s), statusErr);
 }
 
 // AGENT_PREFS: an agent's own settings rows, by its id (openAgentPrefs)
@@ -21115,8 +21137,6 @@ const AGENT_PREFS = {
   claude: ["fullContextRow"],
   grok: ["fullContextRow"],
 };
-// an agent with a telemetry switch (agent/telemetry.go) has a sheet for it
-// when it has no other settings
 const agentPrefsOf = (a) => gatewayMode ? null : AGENT_PREFS[kindOf(a)] || (a.telemetry ? [] : null);
 
 // telemetryRow: the agent's own telemetry off in its config (OipsAnthony on X)
@@ -21127,6 +21147,7 @@ function telemetryRow(a) {
   who.append(el("div", "name", t("Telemetry")));
   who.title = t("Written in {file}: {keys}", { file: st.file, keys: (st.keys || []).join(", ") });
   if (st.error) who.append(el("div", "sub", t("{file} couldn't be read", { file: st.file })));
+  else if (st.all) who.append(el("div", "sub", st.allError || t("Off for all agents in Settings › Privacy")));
   else if (st.off && st.own?.length) who.append(el("div", "sub", t("Turned off in your own config too: {keys}", { keys: st.own.join(", ") })));
   const again = () => {
     const now = state.agents.find((x) => x.id === a.id);
@@ -21141,7 +21162,7 @@ function telemetryRow(a) {
       again();
     }, (e) => { status(t(e.message), "err"); again(); });
   });
-  if (st.error) for (const b of box.querySelectorAll("button")) b.disabled = true;
+  if (st.error || st.all) for (const b of box.querySelectorAll("button")) b.disabled = true;
   row.append(who, box);
   return row;
 }
@@ -21857,12 +21878,9 @@ function renderRedact(s, keep) {
     onOff(s.redactShape, (redactShape) => savePrefs({ ...keep, redactShape }))).id = "redactShapeRow";
   row(t("Mask personal data"), t("Emails, phone numbers, ID and bank card numbers too"),
     onOff(s.redactPersonal, (redactPersonal) => {
-      // turned on, the accounts on screen are hidden too
       if (redactPersonal) window.hideAccounts?.set(true, true);
       savePrefs({ ...keep, redactPersonal });
     }));
-  // each other kind of personal data, on or off of its own while personal
-  // data is masked; only the user's choices are kept (redactKinds)
   if (s.redactPersonal) for (const [id, name, sub, on] of REDACT_KINDS) {
     const kinds = s.redactKinds || {};
     const r = el("div", "row pref redact-kind");
@@ -21874,7 +21892,6 @@ function renderRedact(s, keep) {
     r.append(who, val);
     box.append(r);
   }
-  // Masked words go above this, a list of the redact plugin's (wordList)
   row(t("Masked words in any case"), t("A word also matches in other capitals: Nightjar masks NIGHTJAR and nightjar too"),
     onOff(s.redactWordsAnyCase, (redactWordsAnyCase) => savePrefs({ ...keep, redactWordsAnyCase }))).id = "redactWordsAnyCaseRow";
   row(t("Whole words only"), t("A word is not masked inside a longer one: ABC masks ABC and 'ABC' but not XABCD, and 123456 not 0.123456"),
@@ -21882,22 +21899,24 @@ function renderRedact(s, keep) {
   renderRedactRules(s, row);
   renderMaskActions(s);
   renderMaskTry(s);
-  // how it is found: the local model, for what no pattern can tell, over
-  // the rules on every request that masks anything
   const masking = s.redact || s.redactPersonal;
   const why = t("Turn on Mask secrets or Mask personal data first");
   privacyModelRow(find, masking ? "" : why);
   const always = el("span", "static-pill" + (masking ? " on" : ""), masking ? t("Always on") : t("Off"));
   rowIn(find, t("Rules"), masking ? t("Keys, tokens, emails and numbers whose checksum adds up: patterns that are certain, checked on every request") : why, always).id = "maskRulesRow";
-  // the pages' Hide accounts, here too, where privacy is looked for
   if (window.hideAccounts) rowIn(share, t("Hide accounts"), t("Email addresses and account names on every page are blurred, for a screenshot to share"),
     onOff(window.hideAccounts.on(), (on) => { window.hideAccounts.set(on); renderSettings(); }));
+  rowIn(share, t("Turn off telemetry for all agents"), t("Over each agent's own Telemetry switch, an agent found later too"),
+    onOff(s.agentTelemetryOff, (off) => writingPrefs(api("settings/agent-telemetry", { off })).then((ns) => {
+      prefs = state.settings = ns;
+      if (ns.refused) status(ns.refused, "err");
+      renderSettings();
+      refreshAfterSync();
+    }, settingsErr))).id = "agentTelemetryAllRow";
   rowIn(share, t("Count me as a user"), t("Once a day, a random id for this computer with magpie's version and system"),
     onOff(!s.noStats, (on) => savePrefs({ ...keep, noStats: !on })));
-  // rides on that event: nothing goes without it
-  if (!s.noStats) rowIn(share, t("Share the agents, providers and models I use"), t("Sent with that event, by magpie's own ids, with how many of each, and how often each partner was shown, opened and added; a provider you added yourself is only “custom”. No names, addresses, accounts, keys or usage"),
+  if (!s.noStats) rowIn(share, t("Share the agents, providers, models and plugins I use"), t("Sent with that event, by magpie's own ids, with how many of each, and how often each partner was shown, opened and added; a provider you added yourself is only “custom”. Which of Discover's plugins are installed goes to usemagpie.ai for its counts. No names, addresses, accounts, keys or usage"),
     onOff(!s.noUsageStats, (on) => savePrefs({ ...keep, noUsageStats: !on })));
-  // what masking did is a page of its own, Insights › Masking
   if (!featureHides($('#nav button[data-view="masking"]'))) {
     const open = el("button", "", t("Open"));
     open.type = "button";
@@ -21916,7 +21935,6 @@ function privacyModelRow(box, why) {
   const sr = el("div", "row pref");
   sr.id = "pmScoreRow";
   const name = () => { const n = el("div", "name", t("Find with a local model")); n.append(el("span", "badge new", t("New"))); return n; };
-  // nothing is masked: the model has nothing to find more of
   if (why) {
     clearTimeout(pmTimer);
     const who = el("div", "who");

@@ -3529,19 +3529,19 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
    which #929 left widening the whole page until its last agent's
    filter was only reachable by dragging the page sideways, and Plugins'
    kinds on GitHub, wider than a 420px window in Japanese */
-.segs.regions, .connect .segs, .pm-ghbar .segs { max-width: 100%; overflow-x: auto; }
+.segs.regions, .connect .segs, .pm-bar .segs { max-width: 100%; overflow-x: auto; }
 /* no scrollbar-width here: Chromium (WebView2) then drops every
    ::-webkit-scrollbar rule and draws Windows' classic bar, arrows and all,
    under the strip; the app's thin thumb instead, slimmer still */
-:where(body:not(.mac)) :is(.segs.regions, .connect .segs, .pm-ghbar .segs)::-webkit-scrollbar { height: 6px; }
-:where(body:not(.mac)) :is(.segs.regions, .connect .segs, .pm-ghbar .segs)::-webkit-scrollbar-thumb { border-width: 1px; }
+:where(body:not(.mac)) :is(.segs.regions, .connect .segs, .pm-bar .segs)::-webkit-scrollbar { height: 6px; }
+:where(body:not(.mac)) :is(.segs.regions, .connect .segs, .pm-bar .segs)::-webkit-scrollbar-thumb { border-width: 1px; }
 /* on a Mac they scroll with no bar, as a Mac's own tab strips do: the
    system's overlay bar showed over the options' lower half for a moment
    after each scroll, and a click there went to the bar, which paged the
    strip sideways and picked nothing (#1620) */
-:where(body.mac) :is(.segs.regions, .connect .segs, .pm-ghbar .segs) { scrollbar-width: none; }
-:where(body.mac) :is(.segs.regions, .connect .segs, .pm-ghbar .segs)::-webkit-scrollbar { display: none; }
-.segs.regions .opt, .connect .segs .opt, .pm-ghbar .segs .opt { flex: none; }
+:where(body.mac) :is(.segs.regions, .connect .segs, .pm-bar .segs) { scrollbar-width: none; }
+:where(body.mac) :is(.segs.regions, .connect .segs, .pm-bar .segs)::-webkit-scrollbar { display: none; }
+.segs.regions .opt, .connect .segs .opt, .pm-bar .segs .opt { flex: none; }
 /* a custom provider's five Base URL APIs wrap to a second row where the
    editor is too narrow for them (#1346); the thumb follows the row */
 .segs.base-apis { max-width: 100%; flex-wrap: wrap; }
@@ -4131,6 +4131,9 @@ input.words.remote-key { width: 160px; }
 .warm-at.times > :not(.warm-times) { flex: none; }
 .warm-at .warm-times { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px 8px; min-width: 0; }
 .warm-at .warm-time { display: inline-flex; align-items: center; gap: 2px; }
+.bark-box { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-left: auto; min-width: 0; max-width: 100%; }
+.bark-box input.words { width: 180px; }
+.bark-box code { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
 .warm-at .warm-rm, .warm-at .warm-add { min-width: 24px; height: 27px; padding: 0 6px; font-size: 14px; line-height: 1; }
 .row.pref .sub .warn { color: var(--amber); }
 .row.pref .sub.wraps { white-space: normal; }
@@ -4258,7 +4261,8 @@ html.theming, html.theming *, html.theming *::before, html.theming *::after {
 /* ---------- modal ---------- */
 .modal {
   position: fixed; inset: 0; z-index: 20;
-  display: flex; align-items: center; justify-content: center; padding: 28px 24px;
+  --grip-h: var(--top-h, 46px);
+  display: flex; align-items: center; justify-content: center; padding: max(28px, var(--grip-h)) 24px;
   background: rgba(0, 0, 0, .28);
   -webkit-backdrop-filter: blur(8px) saturate(1.1); backdrop-filter: blur(8px) saturate(1.1);
 }
@@ -4271,7 +4275,20 @@ html.theming, html.theming *, html.theming *::before, html.theming *::after {
 .modal.out { pointer-events: none; }
 /* open, it holds its place from a top app.js gives it (holdModal) */
 .modal.held { align-items: flex-start; }
-.modal .dialog { position: relative; }
+.modal .dialog { position: relative; z-index: 1; }
+/* the scrim covers the title bar, so the window is still dragged from the
+   top strip while a dialog is open; the dialog lies over it and stays no-drag
+   (the strip is after it in the markup, app.js keeps the dialog the first child).
+   The modal's padding is at least the strip's height, so a tall dialog never
+   lies over the strip's middle (the strip was only free at the sides, and the
+   bar's middle is where a window is taken). */
+.modal-grip { position: absolute; z-index: 0; top: 0; left: 0; right: 0; height: var(--grip-h); }
+body.window.mac .modal { --grip-h: calc(50px / var(--zoom, 1)); }
+/* On the Mac the scrim begins under the bar, and the bar itself (the header,
+   the sidebar's top) is inert while a dialog is open (modalBackground), so
+   nothing there drags: the strip reaches up over it. (A fixed child wouldn't:
+   the scrim's backdrop-filter is its containing block.) */
+body.window.mac .modal-grip { top: calc(-1 * var(--grip-h)); }
 .modal .dialog {
   width: min(600px, 100%); min-width: 0; max-height: 100%; overflow-y: auto;
   border-radius: 14px; background: var(--card);
@@ -4324,7 +4341,7 @@ html.theming, html.theming *, html.theming *::before, html.theming *::after {
 /* Keep native window chrome outside the scrim and dialog. In particular, the
    macOS traffic lights must never sit on top of modal content. */
 body.window.mac .modal { top: calc(50px / var(--zoom, 1)); padding: 16px 24px 24px; }
-body.window .modal { padding: 16px 24px 24px; }
+body.window .modal { padding: max(16px, var(--grip-h)) 24px 24px; }
 body.panel .modal { padding: 16px 12px; }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes content-in { from { opacity: .5; transform: translateY(2px); } }
@@ -4372,7 +4389,7 @@ body.panel .modal { padding: 16px 12px; }
   body.web .segs .thumb { border-radius: 6px; }
   body.web .segs .opt { height: 28px; padding: 0 11px; font-size: 13px; }
   body.web .segs .opt::after { content: ""; position: absolute; left: 0; right: 0; top: -8px; bottom: -8px; }
-  body.web :is(.segs.regions, .connect .segs, .pm-ghbar .segs, .ctx-contents-head .segs, .editor.importapps .approw .segs) { overflow-y: hidden; }
+  body.web :is(.segs.regions, .connect .segs, .pm-bar .segs, .ctx-contents-head .segs, .editor.importapps .approw .segs) { overflow-y: hidden; }
   body.web .text { padding: 8px 10px; }
   body.web .copy { min-width: 44px; }
   body.web .fields { width: 100%; grid-template-columns: minmax(0, 1fr) minmax(0, 124px); }
@@ -5152,6 +5169,6 @@ body .row.agent .ag-prefs .row.pref .who { display: block; }
 .sess-pick.led-more svg { transform: none; }
 .sess-tools .led-rename { flex: none; width: 180px; height: 26px; padding: 0 8px; border-radius: 7px; font-size: 12px; }
 /* Settings › About › Open-source licenses: the notices, as written */
-.notices-text { margin: 0; font: 11px/1.5 var(--code); white-space: pre-wrap; overflow-wrap: anywhere; }
+.notices-text { grid-column: 1 / -1; min-width: 0; margin: 0; font: 11px/1.5 var(--code); white-space: pre-wrap; overflow-wrap: anywhere; }
 .client-cert { display: grid; gap: 6px; min-width: 0; }
 .client-cert input { width: 100%; min-width: 0; }

@@ -106,6 +106,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie accounts add copilot [--host <name>.ghe.com]   one more Copilot account, on github.com or an enterprise's GHE.com
   magpie accounts discovery [on|off]   read agents' sign-ins (default on; MAGPIE_NO_ACCOUNTS=1 disables too)
   magpie accounts import <codex|claude|antigravity|factory> <file>... [--yes]   bring in accounts from other tools' files (Codex's auth.json, Cockpit Tools, CLIProxyAPI, Sub2API, claude-swap); the tool a ChatGPT or Claude file came from is signed out of it
+  magpie accounts export <codex|claude> [<email>...] [--format sub2api|cliproxyapi] [--to <folder>] [--yes]   write accounts as a file Sub2API, CLIProxyAPI or magpie imports (0600; holds live sign-ins)
   magpie accounts import codex <file>... --access-only   keep each ChatGPT account with its access token only: never renewed, so the tool it came from stays signed in
   magpie accounts access-only codex <email> [on|off]   keep a ChatGPT account access token only, or let magpie renew its sign-in again
   magpie accounts switch <agent> <email|name>   sign the agent in to another of them, by its email or the name you gave it
@@ -469,6 +470,7 @@ func run(args []string) error {
 	// for on a model of its own, on the model of magpie's picked beside
 	// its ChatGPT sign-in rather than on that account (atom_Ray on X)
 	gateway.CodexSideModel = agent.CodexSideModel
+	gateway.CodexModelNow = agent.CodexModelNow
 	gateway.CodexSideSet = agent.CodexSideSet
 	// the list the Codex app reads from a file beside the ChatGPT sign-in,
 	// its picker showing magpie's models only so (laddieyao on Discord),
@@ -492,6 +494,9 @@ func run(args []string) error {
 	// and Claude Science's daemon, which a restart of the computer ends,
 	// started on the gateway again while it is connected
 	gateway.WhileServing = append(gateway.WhileServing, agent.KeepClaudeScience)
+	// and every agent's own telemetry off while Settings › Privacy says so,
+	// an agent found since too
+	gateway.WhileServing = append(gateway.WhileServing, agent.KeepTelemetryAllOff)
 	// and the Claude Code magpie downloaded for a machine with none (a
 	// server's, a container's), at Claude Code's newest release: its runs
 	// turn its own updater off

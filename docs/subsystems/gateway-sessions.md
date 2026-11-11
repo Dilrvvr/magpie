@@ -260,6 +260,14 @@ database gives it, so `Titles` looks a `zcode:` key up under both and
 answers under the id asked for (#5195). Verification:
 `TestZCodeTitlesByRequestID`.
 
+A ZCode session's name is the app's: its task index
+(`v2/tasks-index.sqlite` in the data folder, `tasks.title` by `task_id`,
+the session's id) holds what the app shows and what the user renamed it to,
+and the CLI database's title is a guess or the default. `zcodeTaskOf`
+(`zcode_tasks.go`) overlays it on `zcDB.info`, and the task's `updated_at`
+counts toward the file's time so a rename is read again. Verification:
+`TestZCodeTitleIsTheAppsTaskName`.
+
 Routing's stage names the session an account is serving (connor_yang on
 Discord): a row answering, or that answered, the request shown adds that
 request's session title after its status, on one line cut short with the
@@ -384,8 +392,16 @@ at the value its row shows) and a row per agent.
 `magpie sessions read [on|off all|<agent>…]` shows and changes the same
 choice from the CLI (`sessionReadsTo`); while it is not asked,
 `magpie sessions` says so on stderr and the TUI's empty Sessions page
-says how (`sessNothing`). Tests: `TestSessionsRead`,
-`TestSessionsNotAskedSaysHow`.
+says how (`sessNothing`). With no provider set up, Claude Code's and Codex's sessions, and each
+call's tokens and duration, need only this consent: the session files are
+the source (`/api/usage/requests` rows with `source: "log"`, the speed a
+call's tokens over its time gives, shown as a floor). An empty Usage
+Overview or Requests page says so while `asked` is false and offers the
+agents found with one button (`readsNote` in the usage plugin's
+`page.js`; simonzyzy on X), and the Sessions page says the live output
+speed curve is measured only on requests through the gateway
+(`sm-speed-note`). Tests: `TestSessionsRead`,
+`TestSessionsNotAskedSaysHow`, `usage-reads-note.test.cjs`.
 
 In gateway mode (`magpie web`'s page, [`gatewaymode.go`](../../internal/gui/gatewaymode.go))
 no agent's own session files are read, whatever `SessionReads` says

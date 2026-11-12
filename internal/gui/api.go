@@ -186,6 +186,9 @@ type fieldJSON struct {
 	Label   string         `json:"label"`
 	Value   string         `json:"value"`
 	Options []agent.Option `json:"options"`
+	// List is, in place of Options, which of the state's OptionLists the
+	// field offers, from 1 (shareOptions); 0 when Options is its own
+	List int `json:"list,omitempty"`
 }
 
 type agentJSON struct {
@@ -262,6 +265,9 @@ type agentJSON struct {
 	// copies; Terminal: and opens in a terminal, this system having one
 	Command  string `json:"command,omitempty"`
 	Terminal bool   `json:"terminal,omitempty"`
+	// OpenApp: its Open button opens the desktop app, not a terminal
+	// (Codex, by the setting codexOpen, Yink88564391 on X)
+	OpenApp bool `json:"openApp,omitempty"`
 }
 
 // clientJSON is an agent, or another client the gateway knows, as a
@@ -336,6 +342,13 @@ type stateJSON struct {
 	// GatewayHeld: the program that has the gateway's port when this magpie
 	// couldn't listen on it, as far as it could be read (gateway.PortHeld)
 	GatewayHeld *gateway.PortHeld `json:"gatewayHeld,omitempty"`
+	// OptionLists are the fields' option lists, each once, that a field's
+	// List names (shareOptions), as indexes into Options, where each option
+	// is once: with real accounts 13 agents' model pickers offered the same
+	// 51KB catalog, 650KB of a 690KB state, beside a few models of their
+	// own. Last of the fields: writeStateJSON writes them after the rest.
+	OptionLists [][]int32       `json:"optionLists,omitempty"`
+	Options     []*agent.Option `json:"options,omitempty"`
 }
 
 // unlistedJSON is a model of a provider kept for routing groups, and the
@@ -1125,6 +1138,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	mux.Handle("/", devPage(revalidated(http.FileServer(http.FS(staticFS())))))
 	devRoutes(mux)
 	pluginPageRoutes(mux, isWeb(w))
+	feedbackRoutes(mux)
 	// boot.js hands the page the saved language and theme before it paints:
 	// they came only with the settings, so the tabs showed English first
 	mux.HandleFunc("GET /boot.js", func(rw http.ResponseWriter, r *http.Request) {
@@ -1141,6 +1155,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		if !isWeb(w) {
 			if hc := systemHourCycle(); hc != "" {
 				boot["hourCycle"] = hc
+			}
+			if loc := systemLocale(); loc != "" {
+				boot["locale"] = loc
 			}
 		}
 		if s.Colorblind {
@@ -1607,7 +1624,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		// is in (yi_time)
 		if (!slices.Equal(settings.Load().TrayUsages, cur.TrayUsages) || in.TrayUsageEvery != cur.TrayUsageEvery ||
 			in.TrayNoLogos != cur.TrayNoLogos || in.TrayNoBird != cur.TrayNoBird || in.TrayNoNumber != cur.TrayNoNumber || in.TrayPace != cur.TrayPace ||
-			in.TrayNoCost != cur.TrayNoCost || !maps.EqualFunc(in.TrayWindows, cur.TrayWindows, slices.Equal) || in.Lang != cur.Lang) && onTrayUsage != nil {
+			in.TrayNoCost != cur.TrayNoCost || !maps.EqualFunc(in.TrayWindows, cur.TrayWindows, slices.Equal) || in.Lang != cur.Lang || in.ChineseUnits != cur.ChineseUnits) && onTrayUsage != nil {
 			onTrayUsage()
 		}
 		// an alert turned on or moved is looked at now, the Mac asked for its
@@ -1766,6 +1783,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		s := settings.Load()
 		s.UpdateSkip = strings.TrimSpace(in.Version)
+		if s.UpdateSkip != "" {
+			updates.quietAgain() // a dismissal holds for the quiet, not only the next release
+		}
 		if err := settings.Save(s); err != nil {
 			fail(rw, err)
 			return
@@ -1947,6 +1967,28 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			c = &settings.AgentCompact{At: in.At, Full: in.Full}
 		}
 		if err := provider.SetAgentCompact(in.Agent, c); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// the windows one agent is told, apart from every other's
+	// (settings.AgentContexts): Contexts replaces them, none takes them away
+	mux.HandleFunc("POST /api/settings/agent-contexts", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Agent    string
+			Contexts map[string]int
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		a, err := agent.Find(in.Agent)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetAgentContexts(a.ListsFor(), in.Contexts); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -2146,6 +2188,20 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			return
 		}
 		if err := provider.SetCodexServiceTier(in.Tier); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// what the Open button of Codex's Agents row opens: "", "app" or
+	// "terminal" (Yink88564391 on X)
+	mux.HandleFunc("POST /api/settings/codex-open", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Open string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetCodexOpen(in.Open); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -2521,11 +2577,12 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	// not sent stays as it is
 	mux.HandleFunc("POST /api/usage/arrange", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Order        *[]string
-			PanelHidden  *[]string
-			AgentsHidden *[]string
-			CardsHidden  *[]string
-			Count        *struct{ Client, As string }
+			Order         *[]string
+			PanelHidden   *[]string
+			AgentsHidden  *[]string
+			CardsHidden   *[]string
+			WindowsHidden *[]string
+			Count         *struct{ Client, As string }
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			fail(rw, err)
@@ -2551,6 +2608,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		if in.CardsHidden != nil {
 			s.UsageCardsHidden = *in.CardsHidden
+		}
+		if in.WindowsHidden != nil {
+			s.UsageWindowsHidden = *in.WindowsHidden
 		}
 		if err := settings.Save(s); err != nil {
 			fail(rw, err)
@@ -3197,6 +3257,7 @@ func state() stateJSON {
 		// as agentCommand makes it, Launch asked once
 		aj.Command = agentLine(a, aj.Launch, runtime.GOOS)
 		aj.Terminal = terminalHere() && aj.Command != ""
+		aj.OpenApp = a.ID == "codex" && codexOpensApp()
 		if a.Native != nil {
 			native := a.Native.Read()
 			aj.Native = &native

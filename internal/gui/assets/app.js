@@ -9766,7 +9766,8 @@ function drawEditor(p, presetID) {
         took.push(t("Base URL") + " (" + t(API_NAMES[api]) + ")");
       }
     }
-    if (c.key) { key.value = draft.key = c.key; countKeys(); took.push(t("API key")); }
+    // no key box when keys are Accounts: none taken unseen
+    if (c.key && key.isConnected) { key.value = draft.key = c.key; countKeys(); took.push(t("API key")); }
     if (curlModel && c.model) { curlModel(c.model); took.push(t("model {model}", { model: c.model })); }
     if (took.length) notes.push(env ? t("Filled in from the pasted text: {what}.", { what: took.join(" · ") }) : t("Filled in from the curl command: {what}.", { what: took.join(" · ") }));
     if (curlBase && !c.api) notes.push(t("Its URL isn't an address ending in /chat/completions, /messages or /responses: type the base URL."));
@@ -19383,8 +19384,10 @@ const CURRENCIES = [["usd", "$ USD"], ["cny", "¥ CNY"], ["provider", "By provid
 // The text size is the windows' own zoom, as a browser's Ctrl/Cmd +: the
 // page is laid out again in larger CSS pixels, so everything it measures is
 // as at 100%, and magpie sizes the windows around it (textsize.go). None is
-// under 100%: WebView2 and WebKitGTK zoom no smaller through Wails.
-const TEXT_SIZES = [100, 110, 125, 150];
+// under 100%: WebView2 and WebKitGTK zoom no smaller through Wails. 115 and
+// 120 sit between 110 and 125, where 110 read small and 125 crowded on a 4K
+// screen at 200% (WeltAn_X on X).
+const TEXT_SIZES = [100, 110, 115, 120, 125, 150];
 const textSizeKeys = () => /^Mac/.test(navigator.platform) ? "⌘+ ⌘− ⌘0" : "Ctrl+ Ctrl− Ctrl+0";
 // --zoom is the text size for what is placed against the window's own
 // drawing, which does not grow with the page: the Mac's traffic lights.
@@ -20051,6 +20054,8 @@ function setUpdateMirror(mirror) {
   return writingPrefs(api("settings/update-mirror", { mirror }))
     .then((ns) => { prefs = ns; mirrorEditing = false; mirrorDraft = mirrorErr = ""; renderSettings(); status(t("Saved"), "ok", 1500); return ns; });
 }
+// Use a mirror… and Change open the field from mirroredit.js
+const editMirror = (r, s, v) => import("./mirroredit.js").then(() => { mirrorEditing = true; mirrorDraft = v; renderUpdateMirror(r, s); }, statusErr);
 function renderUpdateMirror(r, s) {
   r.classList.add("update-mirror-row");
   const who = r.querySelector(".who"), val = r.querySelector(".val");
@@ -20061,37 +20066,24 @@ function renderUpdateMirror(r, s) {
   const m = s.updateMirror || "";
   sub.textContent = mirrorErr || (m ? t("Updates are downloaded from usemagpie.ai, and through this mirror when that fails, each checked against usemagpie.ai's checksum")
     : t("Updates are downloaded from usemagpie.ai, and from GitHub when that fails; a mirror can stand in for GitHub where it is slow"));
+  // the docs' Mirrors page says which mirror and how (WeltAn_X on X)
+  const more = el("button", "sub-more", t("How mirrors work"));
+  more.onclick = () => api("open", { url: "https://usemagpie.ai/docs/" + ({ zh: "zh/", "zh-TW": "zh/", ja: "ja/" }[locale] || "") + "mirrors#settings" }).catch(() => {});
+  sub.append(" ", more);
   sub.classList.toggle("err", !!mirrorErr);
   sub.title = t("The update and its checksum always come from usemagpie.ai; a file from the mirror that doesn't match it is not installed.");
-  if (!mirrorEditing) {
-    if (m) {
-      const official = el("button", "text", t("Remove mirror"));
-      official.onclick = () => setUpdateMirror("").catch(statusTErr);
-      const change = el("button", "text", t("Change"));
-      change.onclick = () => { mirrorEditing = true; mirrorDraft = m; renderUpdateMirror(r, s); };
-      val.append(el("code", "", m), change, official);
-    } else {
-      const add = el("button", "text", t("Use a mirror…"));
-      add.onclick = () => { mirrorEditing = true; mirrorDraft = ""; renderUpdateMirror(r, s); };
-      val.append(el("code", "", "usemagpie.ai"), add);
-    }
-    return;
+  if (mirrorEditing) return mirrorEdit(r, s, sub, val);
+  if (m) {
+    const official = el("button", "text", t("Remove mirror"));
+    official.onclick = () => setUpdateMirror("").catch(statusTErr);
+    const change = el("button", "text", t("Change"));
+    change.onclick = () => editMirror(r, s, m);
+    val.append(el("code", "", m), change, official);
+  } else {
+    const add = el("button", "text", t("Use a mirror…"));
+    add.onclick = () => editMirror(r, s, "");
+    val.append(el("code", "", "usemagpie.ai"), add);
   }
-  const i = input(mirrorDraft, "https://mirror.example/");
-  i.className = "words update-mirror-input";
-  i.setAttribute("aria-label", t("Mirror address"));
-  i.oninput = () => { mirrorDraft = i.value; };
-  const save = el("button", "text", t("Save"));
-  save.onclick = () => {
-    const v = i.value.trim();
-    if (!v) return i.focus(NO_SCROLL);
-    setUpdateMirror(v).catch((e) => { mirrorErr = t(e.message); statusTErr(e); renderSettings(); });
-  };
-  const cancel = el("button", "text", t("Cancel"));
-  cancel.onclick = () => { mirrorEditing = false; mirrorDraft = mirrorErr = ""; renderUpdateMirror(r, s); };
-  i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") save.onclick(); else if (e.key === "Escape") cancel.onclick(); };
-  val.append(i, cancel, save);
-  queueMicrotask(() => { if (i.isConnected && document.activeElement !== i) i.focus(NO_SCROLL); });
 }
 
 function renderSettings() {
@@ -21211,22 +21203,24 @@ function renderWarmNow(agent, users, rowId) {
   if (users.length > 1) b.setAttribute("aria-haspopup", "menu");
   const send = async (user) => {
     const say = (o) => { warmNowSaid[agent] = o; if ($(rowId).isConnected) renderWarmNow(agent, users, rowId); };
-    say({ busy: true, text: t("Warming up {who}…", { who: user }) });
-    try {
-      await api("warm-now", { agent, user });
-      say({ text: t("Warmed up {who} {when}", { who: user, when: syncWhen(new Date().toISOString()) }) });
-      status(t("Warmed up {who}", { who: user }), "ok");
-      loadQuotas(); // the window it started
-    } catch (e) {
-      say({ bad: true, text: t("Couldn't warm up {who}: {why}", { who: user, why: e.message }) });
-      status(t("Couldn't warm up {who}: {why}", { who: user, why: e.message }), "err");
-    }
+    // "" is All accounts (CoderMaurice on X): each in use and not in a
+    // window already, what each came to on the one line
+    const who = user || t("All accounts");
+    say({ busy: true, text: t("Warming up {who}…", { who }) });
+    let rs;
+    try { rs = user ? (await api("warm-now", { agent, user }), [{ user }]) : (await api("warm-all", { agent })).results; } catch (e) { rs = [{ user: who, error: e.message }]; }
+    const by = (f) => rs.filter(f).map((r) => r.user).join(", "), ok = by((r) => !r.skip && !r.error), on = by((r) => r.skip == "running"), bad = rs.filter((r) => r.error);
+    const text = [ok && t("Warmed up {who} {when}", { who: ok, when: syncWhen(new Date().toISOString()) }), on && t("Already in a window: {who}", { who: on }),
+      ...bad.map((r) => t("Couldn't warm up {who}: {why}", { who: r.user, why: r.error }))].filter(Boolean).join(" · ") || t("No account in use to warm up");
+    say({ bad: !!bad.length, text });
+    status(text, bad.length ? "err" : "ok");
+    if (ok) loadQuotas(); // the windows it started
   };
   b.onclick = (e) => {
     e.stopPropagation();
     if (users.length === 1) return send(users[0]);
     if (b.classList.contains("open")) return closeProtoMenu();
-    openProtoMenu(b, users.map((u) => ({ v: u, name: u, note: "", literalName: true })), null, send, "Warm up which account", "sess-menu", "right");
+    openProtoMenu(b, [{ v: "", name: "All accounts", note: "" }, ...users.map((u) => ({ v: u, name: u, note: "", literalName: true }))], null, send, "Warm up which account", "sess-menu", "right");
   };
   box.replaceChildren(b);
 }

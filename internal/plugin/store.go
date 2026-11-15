@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filelock"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/lazyre"
@@ -73,6 +74,17 @@ type List struct {
 }
 
 var listMu sync.Mutex
+
+// listFileMu is held through every read a change is made from and its
+// write of plugins.json (the mutators below): the gateway that runs all
+// day and a magpie run from a terminal (`magpie plugin options …`, the
+// plugin manager) are separate processes, and listMu never saw the other
+// one, so the later whole-list write went out with what the other had
+// saved since its read (#4666). Under it every change reads the file
+// afresh, so both changes stand. A lock another magpie holds is waited
+// for up to filelock.Wait, then gone on without, as before there was
+// one; the same shape as mcpauth's fileMu.
+var listFileMu = filelock.Mutex{Path: func() string { return listPath() + ".lock" }}
 
 // bunMu is held through each bun command that changes plugins/ (add,
 // update, remove). Two at once read package.json and bun.lock before
@@ -475,8 +487,10 @@ func add(ctx context.Context, spec, version string) (Entry, error) {
 		}
 		return Entry{}, err
 	}
+	listFileMu.Lock()
 	listMu.Lock()
 	defer listMu.Unlock()
+	defer listFileMu.Unlock()
 	l := Load()
 	e := Entry{Spec: spec}
 	name := Name(spec)
@@ -620,11 +634,13 @@ func indexOf(l List, name string) int {
 
 // Remove takes a plugin off the list (and out of plugins/).
 func Remove(ctx context.Context, name string) error {
+	listFileMu.Lock()
 	listMu.Lock()
 	l := Load()
 	i := indexOf(l, name)
 	if i < 0 {
 		listMu.Unlock()
+		listFileMu.Unlock()
 		return fmt.Errorf("no plugin %q", name)
 	}
 	e := l.Plugins[i]
@@ -632,6 +648,7 @@ func Remove(ctx context.Context, name string) error {
 	maps.DeleteFunc(l.Prefer, func(_, s string) bool { return s == e.Spec })
 	err := save(l)
 	listMu.Unlock()
+	listFileMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -648,8 +665,10 @@ func Remove(ctx context.Context, name string) error {
 
 // SetOff turns a plugin off or back on.
 func SetOff(name string, off bool) error {
+	listFileMu.Lock()
 	listMu.Lock()
 	defer listMu.Unlock()
+	defer listFileMu.Unlock()
 	l := Load()
 	i := indexOf(l, name)
 	if i < 0 {
@@ -669,8 +688,10 @@ func SetOff(name string, off bool) error {
 // with it; one switched off leaves the id to the others until it is on
 // again.
 func Prefer(name, id string) error {
+	listFileMu.Lock()
 	listMu.Lock()
 	defer listMu.Unlock()
+	defer listFileMu.Unlock()
 	l := Load()
 	i := indexOf(l, name)
 	if i < 0 {
@@ -693,8 +714,10 @@ func Prefer(name, id string) error {
 // SetOptions sets the options a plugin is handed (a middleware's
 // ctx.options); nil takes them away.
 func SetOptions(name string, opts map[string]any) error {
+	listFileMu.Lock()
 	listMu.Lock()
 	defer listMu.Unlock()
+	defer listFileMu.Unlock()
 	l := Load()
 	i := indexOf(l, name)
 	if i < 0 {
@@ -784,17 +807,6 @@ func install(ctx context.Context, spec string) error {
 	mendDist(ctx, bun)
 	before := depsNow()
 	err = bunAdd(ctx, bun, spec)
-	// Bun writes the dependency into package.json before it installs, and
-	// exits 1 with it there when any package fails, this one or another.
-	// One no plugin is installed as (a failed add's, before this was
-	// put back) failed every add after it: taken out, and the add tried
-	// again
-	var gone []string
-	if err != nil {
-		if gone = dropBroken(err, spec); len(gone) > 0 {
-			err = bunAdd(ctx, bun, spec)
-		}
-	}
 	// a @magpie-community package or version npm doesn't have (a new
 	// one waits for an owner to publish it there) comes from the
 	// community repo's dist branch; one Bun's minimumReleaseAge holds
@@ -803,7 +815,8 @@ func install(ctx context.Context, spec string) error {
 	var ue *BunUnstartableError
 	if name, version, ok := distWanted(spec); ok && err != nil && !minAge.MatchString(err.Error()) && !errors.As(err, &ue) {
 		if derr := installDist(ctx, bun, name, version); derr != nil {
-			err = fmt.Errorf("%w (and from the community repo's dist branch: %v)", err, derr)
+			// both wrapped: what Bun said at either try is read (failedOf)
+			err = fmt.Errorf("%w (and from the community repo's dist branch: %w)", err, derr)
 		} else {
 			err = nil
 		}
@@ -817,7 +830,7 @@ func install(ctx context.Context, spec string) error {
 	if err != nil {
 		// nothing of a failed add stays: a dependency left in package.json
 		// is installed again at every bun command, and no plugin lists it
-		before.undo(gone)
+		before.undo()
 		return err
 	}
 	pruneDist()
@@ -825,9 +838,25 @@ func install(ctx context.Context, spec string) error {
 	return nil
 }
 
-// bunAdd adds spec to plugins/ with bun, its scripts left unrun.
-// installMu held.
-func bunAdd(ctx context.Context, bun, spec string) error {
+// bunAdd adds spec to plugins/ with bun, its scripts left unrun. keep
+// are more packages the add is for (a dist tarball's: its spec is a
+// path). installMu held.
+//
+// Bun writes the dependency into package.json before it installs, and
+// exits 1 with it there when any package fails, this one or another. One
+// no plugin is installed as (a failed add's, before that was put back)
+// failed every add after it: taken out, and the add tried again. Here, so
+// every add has it: the dist branch's too (CHENGJIAHEGOXIS on X, v0.1.4205:
+// GoAnyAPI, not on npm, failed from dist over agency-agents).
+func bunAdd(ctx context.Context, bun, spec string, keep ...string) error {
+	err := bunAddOnce(ctx, bun, spec)
+	if err != nil && len(dropBroken(err, append([]string{spec}, keep...)...)) > 0 {
+		err = bunAddOnce(ctx, bun, spec)
+	}
+	return err
+}
+
+func bunAddOnce(ctx context.Context, bun, spec string) error {
 	out, err := bunCommand(ctx, bun, Dir(), "add", "--ignore-scripts", spec).CombinedOutput()
 	if err != nil {
 		if hint := missingLibs(string(out)); hint != "" {

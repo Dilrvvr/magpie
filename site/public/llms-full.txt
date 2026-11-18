@@ -6531,7 +6531,7 @@ New Bots in DS Bot start on DSH's agent-default-model, so a Bot you make now is 
 
 ## Web search
 
-DS Bot's web search goes through magpie too. When magpie has nothing to search with yet, it asks you to set up a provider that searches by itself (DeepSeek, Claude, Codex, …) or a search API under Settings › Web search.
+DS Bot's web search goes through magpie too. When magpie has nothing to search with yet, it asks you to set up a provider that searches by itself (DeepSeek, Claude, Codex, …) or a search API under Settings › Models › Web search.
 
 ## Before DS Bot is opened
 
@@ -10812,6 +10812,12 @@ docker exec -it magpie magpie claude-code install
 ```
 
 A Grok (SuperGrok) subscription signs in through xAI’s Grok Build CLI, which the image doesn’t have either. Its sign-in, in the browser UI or with `magpie plugin login grok`, installs it first, as xAI’s installer does: the stable version from `x.ai/cli`, kept in `/config/home/.grok`. To use a Grok Build binary you put on the volume yourself, set `GROK_BIN_DIR` to the folder holding it.
+
+## MCP servers
+
+The Library’s MCP servers run in the container, and the image has what they start with: `npx`, `node` and `npm` (Node 24), and `uvx`, `uv`, `python` and `python3`. A server started with `uvx` or `python` downloads its Python into the volume the first time, which takes a few seconds. A server started with `docker` doesn’t run: the container has no Docker of its own.
+
+The image has no browser. Chrome DevTools’ and Playwright’s MCP servers start a Chrome of their own, so in the container their row in the Library says no Chrome here. Use Magpie Browser instead, which acts in your own browser, or point the server at a Chrome it can reach: `--browserUrl http://host:9222` for Chrome DevTools, `--cdp-endpoint` for Playwright.
 
 ## Your own browser
 

@@ -140,7 +140,7 @@ line; agents connected to magpie lose it when it quits.
 | QwenPaw      | each agent's `agent.json` in its workspace (`~/.qwenpaw/workspaces/<agent>`, the agents listed in `config.json`), under `$QWENPAW_WORKING_DIR`, else a legacy `~/.copaw`, else `~/.qwenpaw` | model (a `magpie` custom provider in `providers/custom/magpie.json` under QwenPaw's secret folder, `$QWENPAW_SECRET_DIR` or `~/.qwenpaw.secret`, OpenAI Chat at the gateway with magpie's models; the agent's `active_model` set to it, what was there put back on Disconnect; one row per agent, `qwenpaw` the default and `qwenpaw#<id>` the others; an agent on an ACP backend isn't listed; restart QwenPaw after the first connect), effort (the agent's `thinking_level`; magpie's models with reasoning levels are declared `thinking_param_style: "effort"` so QwenPaw applies it) |
 | OpenClaw     | `openclaw.json` in `~/.openclaw` (`$OPENCLAW_CONFIG_PATH`, `$OPENCLAW_STATE_DIR`, `~/.openclaw-<profile>` for `$OPENCLAW_PROFILE`, `~` as `$OPENCLAW_HOME`) | model (a `magpie` provider in `models.providers`, `openai-completions`, with magpie's models in it; `agents.defaults.model`'s primary set to it, what was there put back on Disconnect; `magpie/*` added to a `modelPolicy.allow` that would refuse it; the user's own keys in the provider and its models kept; a chat already on a model keeps it until `/model default`) |
 | jcode        | `config.toml` in `$JCODE_HOME`, else `~/.jcode` | model (a `[providers.magpie]` profile, `openai-compatible`, with magpie's models in it; `[provider] default_provider`/`default_model` set to it, what was there put back on Disconnect; the user's own keys in the profile, such as `headers` and a model's `reasoning_effort`, kept; restart open jcode sessions after connecting) |
-| Dim (alpha, `dima`) | none of Dim's: magpie's own `dim.json` beside its settings, and a `dima` function in your shell profiles | model (Dim's documented start-up variables, set only for that run: `DIM_BASE_URL` the gateway's `/v1`, `DIM_API_FORMAT=openai-compatible`, `DIM_API_KEY`, `DIM_MODEL` and both token limits; Dim's home (`$DIMCODE_HOME`, else `~/.dimcode-alpha`), saved Providers and account are never read or written. Type `dima` in a new terminal; picking Dim's own again takes the function out) |
+| Dim (alpha, `dima`) | Dim's built-in **Magpie** provider, through Dim's own daemon (`$DIMCODE_HOME`, else `~/.dimcode-alpha`), and magpie's own `dim.json` beside its settings | model (Dim's Magpie provider gets the gateway's `/v1` and magpie's key, is turned on and made Dim's model, so a plain `dima` runs on magpie; no other provider is touched, and a key or address you set on the Magpie entry yourself is kept. Picking Dim's own again turns the entry off and puts back the model Dim was on. When Dim's daemon can't be reached, a `dima` function in your shell profiles starts it with `DIM_BASE_URL`, `DIM_API_KEY`, `DIM_MODEL` and the token limits for that run instead) |
 | Mistral Vibe | `config.toml` in `$VIBE_HOME`, else `~/.vibe` | model (a `[[providers]]` entry named magpie with the gateway's `/v1` and the key as an `Authorization` header in `extra_headers`, since Vibe reads keys only from the environment; one `[[models]]` entry per model, aliased `magpie/<provider>/<model>`; `active_model` set to the alias, what was there put back on Disconnect; a `thinking` level the user set on a model kept; restart open vibe sessions after connecting) |
 | MiniMax Code (mcode) | `~/.minimax/config.yaml` (`$MINIMAX_DATA_DIR`, or the folder the desktop app moved it to) | model (a `magpie` custom provider; magpie's models in its /model) |
 | Droid (Factory) | `~/.factory/settings.json` (`$FACTORY_HOME_OVERRIDE`) | model (magpie's models as BYOK `customModels`, in Droid's /model) |
@@ -3351,15 +3351,21 @@ it starts agy untouched. A terminal open already takes the command the
 Launch row copies. Stepping out (`magpie agy default`) takes the block out
 again. `magpie agy env` prints what `agy run` adds.
 
-**Dim** alpha (`dima`, npm's `dimcode-alpha`) is started on magpie the
-way Dim documents for any OpenAI-compatible endpoint: `DIM_BASE_URL`,
-`DIM_API_FORMAT=openai-compatible`, `DIM_API_KEY`, `DIM_MODEL`,
-`DIM_MAX_CONTEXT_TOKENS` and `DIM_MAX_OUTPUT_TOKENS`, for that run only.
-Picking a catalog model (`magpie dim <model>`) keeps it in magpie's own
-`dim.json` and puts a marked `dima` function in your shell profiles, which
-runs `magpie dim run`; Dim's own folder, saved Providers and account are
-not touched. `magpie dim default` takes the file and the function out
-again, and `magpie dim env` prints what `dim run` adds. No WSL twin.
+**Dim** alpha (`dima`, npm's `dimcode-alpha`) has a built-in provider
+named Magpie. Picking a catalog model (`magpie dim <model>`) fills it in
+through Dim's daemon, the way Dim's own app does: the gateway's `/v1`
+(`http://127.0.0.1:3425/v1`, or the port magpie is on), magpie's key, the
+provider turned on, and the model made Dim's pick, with its token limits
+when the gateway doesn't know them. A plain `dima`, or Dim's app, then runs
+on magpie. Dim's other providers are never touched. A key or address you
+set on the Magpie entry yourself is kept; magpie only picks the model.
+`magpie dim default` turns the entry off, clears the key magpie put there
+and puts back the model Dim was on before. The pick is kept in magpie's own
+`dim.json`. Only when Dim's daemon can't be reached does magpie fall back to
+a marked `dima` function in your shell profiles, which runs `magpie dim run`
+with `DIM_BASE_URL`, `DIM_API_FORMAT=openai-compatible`, `DIM_API_KEY`,
+`DIM_MODEL`, `DIM_MAX_CONTEXT_TOKENS` and `DIM_MAX_OUTPUT_TOKENS` for that
+run; `magpie dim env` prints them. No WSL twin.
 
 agy installed in a WSL distro is listed as Antigravity CLI · WSL
 <distro>, found by `~/.gemini/antigravity-cli` or the `agy` command there.
@@ -3843,6 +3849,24 @@ commands find it from a shell that doesn't have `MAGPIE_ADDR` (a systemd
 service's); `--addr host:port` names it by hand, and `magpie status --json`
 prints the role, pid, version and address for a watchdog. Bind-mounting a folder at `/config` in place of a
 named volume works too; it has to be writable by uid 65532.
+
+On SIGTERM (`docker stop`, a Kubernetes rolling update, a service manager),
+`magpie serve` and `magpie web` drain rather than cut what they serve:
+`GET /` answers 503 at once, so `magpie healthcheck` fails and a readiness
+probe takes the pod out of its Service; in a Kubernetes pod the gateway
+keeps accepting for 5s while that reaches kube-proxy and the ingress; then
+it stops accepting and gives the requests in flight, streams included, up
+to `MAGPIE_DRAIN` to finish (seconds or a duration such as `90s`; `0`
+ends as before, after 2s). Unset, it is 20s in a Kubernetes pod, which
+fits the default `terminationGracePeriodSeconds` of 30 with room for
+magpie to save its state after, and 7s elsewhere, inside `docker stop`'s
+10s; raise it together with the grace the platform gives (`docker stop
+-t`, Compose's `stop_grace_period`) for longer turns. Ctrl+C and SIGHUP still
+end it at once. In Kubernetes, probe readiness with
+`exec: {command: [/magpie, healthcheck]}`: an `httpGet` probe comes from
+outside the container and would need a gateway key. Run one magpie per
+`/config` volume, with `strategy: Recreate`: the magpie serving keeps the
+saved sign-ins renewed, and two pods on one volume would both renew them.
 
 #### NAS with agents on other machines
 

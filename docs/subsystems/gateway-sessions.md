@@ -1011,6 +1011,15 @@ picks it up from any folder; when agy is set to use magpie it is the
 agent's launch command (the gateway's variables and `--model`) with
 `--conversation` after it (`sessions.AgyStart`, set by package agent).
 Subagents (`parent_conversation_id`) and agy in WSL are not read.
+agy's calls are also read from the profile T3 Code gives each of its
+Antigravity instances (`t3AgyDirs`): T3 Code runs `agy acp --gemini-dir
+<profile> --app-data-dir antigravity-acp` on the instance's own Google
+sign-in, the profile under `<T3 Code's folder>/userdata/providers/antigravity/`
+(or `dev/…` for its dev server; the folder is `$T3CODE_HOME` or `~/.t3`,
+`appdir.T3Code`), and those requests go to Google, not through the gateway
+(zzzkl on X; `TestAgyCallsInT3Code`, on what agy 1.5.10 wrote run that way).
+`Found` lists agy for those folders too. The Sessions page doesn't list
+them: `agy --conversation` would look in agy's own folder.
 Verification: `TestAgySessions`, `TestAgyTitleLater`, `TestAgyGrows`,
 `TestAgyTranscript`, `TestAgyFolder`, `TestAgyRowOnly`, on conversations agy 1.3.5 and 1.4.7
 wrote in a sandbox.
@@ -1061,6 +1070,24 @@ writes rebuilt the whole ledger, and the app grew to 85 GB. Verification:
 `TestConcurrentCallsShareOneRead`, `TestAgentCallsReadsOneAgent`,
 `TestCodexModelEffort*` in `codex_effort_shared_test.go` (the codex-only
 answer equals the whole ledger's), and `sessions-overview-once.test.cjs`.
+
+The calls a Sessions read rides along for an idle Claude Code session
+(not changed within the hour) it reads from the start go to a pack
+(`calls-v15/*.pack`), not to a shard of the session's own: one file for
+every such session the pass read, written when the pass ends (and every
+32 MB, and in `Saved`), with each session's frames as its shard would
+hold them and an index with a CRC at its end. A session being written
+keeps its shard and `.rev`, which the lines it gains are appended to.
+A session's own shard, which any later read of it writes whole (a pack is never appended to), is read before the pack. A
+pack that can't be read whole is as if it were not there, and its
+sessions are read again; the hourly sweep removes a pack none of whose
+sessions is listed. Before this, a cold read of 12,000 sessions made
+~21,000 files, and on Windows Defender scanned each as it closed: a
+cold page took 20.7 to 31.7 s on xiaomi-gpu, against 5.7 to 5.9 s with
+the pack, and 2.0 to 2.2 s on a restart (shangyuan0818 on X). See
+[`internal/sessions/call_pack.go`](../../internal/sessions/call_pack.go),
+`TestColdSessionsReadWritesOnePack`, `TestPackedCallsServeRequests` and
+`TestPackedSessionGrows`.
 
 ### Calls an app reports itself
 

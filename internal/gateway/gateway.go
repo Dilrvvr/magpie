@@ -593,6 +593,11 @@ type Server struct {
 	// handedOff: another magpie serves the port now, and this one's end
 	// waits for its requests in flight to finish (handover.go)
 	handedOff atomic.Bool
+	// draining and grace: the gateway was told to end and finish what it
+	// has (Drain): GET / answers 503, and its end waits grace for the
+	// requests in flight
+	draining atomic.Bool
+	grace    atomic.Int64
 	// notAccepting: this one let its listener go, for the magpie serving
 	// the port after it to take every connection (stopAccepting); its
 	// Serve ending then waits for the drain
@@ -996,6 +1001,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			// an agent streaming one reads a reply broken off (Codex:
 			// "error decoding response body")
 			log.Printf("gateway: ending after %s with requests still in flight; they are cut (%v)", s.drainFor(), err)
+			// Shutdown leaves them answering: closing their connections
+			// cancels each one's context, so its upstream call ends too
+			// and holds nothing (provider.Hold) past the gateway's end in
+			// a process that goes on (a restart, a test)
+			srv.Close()
 		}
 		<-sockets
 		// An inline description may still have to save after its request
@@ -1239,6 +1249,14 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	// (provider/remote_hub.go); told to whoever the router answers
 	if (local(r) || sharedWith(r)) && hubServes() {
 		out["mcp_hub"] = true
+	}
+	// a gateway ending (Drain) is no longer ready: `magpie healthcheck`,
+	// a container's probe, fails on it, so a load balancer sends new
+	// requests to another while this one finishes its own
+	if s.draining.Load() {
+		out["draining"] = true
+		writeJSON(w, http.StatusServiceUnavailable, out)
+		return
 	}
 	writeJSON(w, 200, out)
 }
@@ -1931,9 +1949,13 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 				// model discovery (parseModelsListResponse) names a row by
 				// before name, so magpie's GLM-5.3-Flash of three providers
 				// read three times the same in its picker (cdredfox on X);
+				// for Dim alpha: its built-in Magpie provider's list
+				// (provider.refresh) names each model by display_name,
+				// which its Models page and search show, so two
+				// providers' DeepSeek read the same there (T_t__biu on X);
 				// and for Claude Code's discovery, whose /model names a row
 				// by display_name alone
-				if agent == "cindy" || discovers {
+				if agent == "cindy" || agent == "dim" || discovers {
 					m["display_name"] = labels[i]
 				}
 				if agent == "cursor-local" {
@@ -9607,6 +9629,11 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	if msg := unportableVideo(to, request); msg != "" {
 		// told, not left out for the model to answer the words alone (#6135)
 		return writeError(w, from, 400, msg), msg
+	}
+	if s.refusesDeferred(p, from, to, model, request) {
+		// Claude Code asks again with every tool declared, so a tool it
+		// loads doesn't change the prompt's start (deferred_route.go)
+		return writeError(w, from, 400, deferredRefusal), deferredRefusal
 	}
 	stream := request.Stream
 	request.Stream = true

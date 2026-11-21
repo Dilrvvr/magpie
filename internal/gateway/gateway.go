@@ -31,6 +31,7 @@ import (
 	"github.com/yetone/magpie/internal/awake"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexrelay"
+	"github.com/yetone/magpie/internal/egress"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/gwbudget"
 	"github.com/yetone/magpie/internal/gwmw"
@@ -575,6 +576,10 @@ type Server struct {
 	// unfit remembers the endpoints each provider's models were turned away
 	// from, so every later turn goes straight to one that takes them.
 	unfit map[string]bool
+	// voidRooms is the reply limit each provider's model is asked for
+	// when a request names none, once its API's own default cut a reply
+	// that said nothing (voidRoom)
+	voidRooms map[string]int
 	// refusedThinking is the thinking blocks each provider and account
 	// refused as signed for another conversation (thinking_bound.go)
 	refusedThinking map[string]bool
@@ -694,6 +699,7 @@ func New() *Server {
 		// nowhere else (provider.KeepsCredentials)
 		client:        &http.Client{Transport: rpmTransport{upstreamTransport()}, CheckRedirect: provider.KeepsCredentials},
 		unfit:         make(map[string]bool),
+		voidRooms:     make(map[string]int),
 		subscription:  newSubscriptionBridge(),
 		sessionsSaved: make(chan struct{}),
 		debug:         os.Getenv("MAGPIE_DEBUG") != "",
@@ -973,6 +979,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		go usage.KeepOutsideCallsRead(ctx)
 		// and moves the built-in subscriptions being retired onto their plugins
 		go provider.KeepRetiringMoved(ctx)
+		// and looks up which region the Claude accounts' way out to the
+		// internet is in, through each of their proxies (internal/egress)
+		go egress.Keep(ctx, provider.ClaudeProxies)
 		// and fetches the partner list every hour, asked for or not
 		go provider.KeepPartnersFresh(ctx)
 		go provider.KeepPluginsListed(ctx) // models a plugin's vendor drops or adds, while magpie runs
@@ -1119,6 +1128,7 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("POST /api/chat", s.ollamaChat(false))
 	mux.HandleFunc("POST /api/generate", s.ollamaChat(true))
 	mux.HandleFunc("GET /v1/magpie/quotas", s.quotas)
+	mux.HandleFunc("GET "+AccountsPath, s.accountsList)
 	mux.HandleFunc("GET /v1/magpie/usage", s.usageSummary)
 	mux.HandleFunc("GET /v1/magpie/usage/requests", s.usageRequests)
 	mux.HandleFunc("POST /v1/magpie/usage/requests", s.usageIngest)
@@ -1280,7 +1290,7 @@ var catalogSize stamped[struct{}, int]
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"name": "magpie", "version": Version, "models": catalogSize.get(struct{}{}, func() int { return len(provider.Catalog()) }), "window": Window,
-		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", NativePath + "{provider}/{path}", "/v1/embeddings", "/v1/rerank", "/v1/decisions", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech", "/v1/realtime", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", StatuslinePath, "/v1/magpie/trace", OwnMCPPath, SearchMCPPath, VisionMCPPath, MemoryMCPPath, SessionsMCPPath, ImageMCPPath, BrowserMCPPath, ToolsMCPPath, HubMCPAll, HubMCPPath + "{agent}"}}
+		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", NativePath + "{provider}/{path}", "/v1/embeddings", "/v1/rerank", "/v1/decisions", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech", "/v1/realtime", "/v1/magpie/quotas", "/v1/magpie/quotas/history", AccountsPath, "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", StatuslinePath, "/v1/magpie/trace", OwnMCPPath, SearchMCPPath, VisionMCPPath, MemoryMCPPath, SessionsMCPPath, ImageMCPPath, BrowserMCPPath, ToolsMCPPath, HubMCPAll, HubMCPPath + "{agent}"}}
 	// which process serves, for another magpie on this computer to name it
 	// on its Routing page (#2606); not told to another machine
 	if local(r) {
@@ -2383,12 +2393,19 @@ func (s *Server) countOn(w http.ResponseWriter, r *http.Request, p provider.Prov
 		counts = slices.DeleteFunc(counts, func(c candidate) bool { return !s.rpms.free(c.who(), c.p.RPMLimit()) })
 		// of those resting, only the one back soonest (#1799)
 		counts = probeOne(counts)
+		// a conversation that stays strictly where it is is counted
+		// there, or by the estimate: Claude Code counts its memory files
+		// again right after a compact, under the session's id, and a key
+		// it never uses for the session was sent them (galaxy_huage on X)
+		if p.Affinity == provider.AffinityStrict {
+			counts = strictCounts(p.ID+"/"+model, r.Header, body, counts)
+		}
 	}
 	// the names in force, read at most once however many candidates are
 	// counted, and not at all where there are none
 	wires := sync.OnceValue(func() map[string]string { return settings.Shared().Wires() })
 	for i, c := range counts {
-		res, err := s.forward(r.Context(), c.p, provider.Anthropic, "/v1/messages/count_tokens", rewriteModel(body, provider.UpstreamNameIn(wires(), c.p.ID, model)), r.Header)
+		res, err := s.forward(r.Context(), c.p, provider.Anthropic, "/v1/messages/count_tokens", rewriteModel(body, provider.UpstreamNameAsIn(wires(), c.p.ID, model, c.p.SentIDAt(model, sentEffortIf(c.p, model, provider.Anthropic, body)))), r.Header)
 		if tooMany := (*errRPM)(nil); errors.As(err, &tooMany) {
 			break // its minute filled since: nobody rests, the estimate answers
 		}
@@ -3478,7 +3495,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// account past the usage cap set on it, and is refused there, not
 	// moved, while the account is held as it won't spend its credits
 	// (#1797)
-	cands, pl, strictHeld := strictKeep(scope, mode, r.Header, body, cands, pl)
+	cands, pl, strictHeld := strictKeep(scope, mode, r.Header, body, plain, cands, pl)
 	// a Codex reset spent before any try, on an account held as it won't
 	// spend its credits
 	var resetFirst *AutoReset
@@ -3788,6 +3805,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// the account and model asked again for a reply that fits the window
 	// the prompt leaves, and how long that is (roomCap)
 	roomFor, roomCap := "", 0
+	// the account and model asked again for the room its model has after
+	// its API's default cut a reply void (noteVoid), once a request
+	voidFor := ""
 	// the key or subscription account the last try went to (#557)
 	providerKeyID, providerKeyName, providerAccount := "", "", ""
 	var other *Try                          // the first failure that wasn't an allowance run out
@@ -4303,6 +4323,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// short (DeepSeek's 8K), asks for the model's own, relayed or
 		// translated (withOwnOutput)
 		attemptBody = withOwnOutput(c.p, c.model, from, attemptBody)
+		// a request naming no reply limit, to a model whose API's own
+		// default cut a reply having said nothing (noteVoid), asks for
+		// the room the model has
+		roomless := !namesOutput(from, attemptBody)
+		attemptBody, voidRoomed := s.withVoidRoom(c.p, c.model, from, attemptBody)
 		attemptBody = withThinkingRoom(c.p, c.model, from, attemptBody)
 		if roomFor == c.who()+"|"+c.model {
 			if b, ok := withReplyCap(from, attemptBody, roomCap); ok {
@@ -5049,6 +5074,27 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				i--
 				continue
 			}
+		}
+		if voidRoomed && !hw.passing && outputFieldRefused(hw.code(), hw.errBody()) {
+			// the room asked for after a void (noteVoid) turned away as
+			// more than the model takes: asked again naming none, as the
+			// client did, and so from then on
+			s.forgetVoidRoom(c.p.ID, c.model)
+			try.Fail = failRoom
+			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			i--
+			continue
+		}
+		if voidFor != c.who()+"|"+c.model && roomless && !voidRoomed && !hw.passing && hw.failed() && bodyHas(hw.errBody(), cutVoidWords) && s.voidRoomOf(c.p.ID, c.model) > 0 {
+			// the request named no reply limit and the API's own default
+			// cut the reply having said nothing (noteVoid): the same one
+			// is asked again, at once, for the room its model has —
+			// another ask, not the same budget burnt twice (#2972)
+			voidFor = c.who() + "|" + c.model
+			try.Fail = failRoom
+			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			i--
+			continue
 		}
 		if roomFor != c.who()+"|"+c.model && !hw.passing && (hw.code() == 400 || hw.code() == 422) {
 			// the window holds the prompt but not the reply asked for with
@@ -6127,6 +6173,14 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// they carry another agent's harness (Pi, OpenCode, and others).
 	if p.Account != nil && p.Account.Agent == "claude" {
 		call.To = provider.Anthropic
+		// the user asked for no Claude request to leave while its way out
+		// is in a region Anthropic doesn't list (egress.Hold): it goes no
+		// further, and as a request that never left, nobody rests for it
+		// and the next member is asked
+		if err := egress.Hold(r.Context(), claudeProxy(r.Context())); err != nil {
+			msg := p.Name + ": " + err.Error()
+			return writeError(w, from, http.StatusBadGateway, msg), msg
+		}
 		return s.serveClaudeSubscription(w, r, from, p, model, body, &call.Usage)
 	}
 	// Copilot's Auto (all a Student plan may pick) is asked which model it
@@ -6789,6 +6843,8 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 			req.Header.Set(provider.SubagentToPluginHeader, v)
 		}
 		tellWorkPlace(req.Header, to, body)
+		// the agent it came from, here or through another magpie
+		tellCaller(ctx, req.Header)
 		req.Header.Del(provider.FallbackHeader)
 		if hasFallback(ctx) {
 			req.Header.Set(provider.FallbackHeader, "1")
@@ -7033,7 +7089,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			capped = int(gjson.GetBytes(body, "max_completion_tokens").Int())
 		}
 	}
-	upstream := provider.UpstreamNameIn(wiresOf(r.Context()), p.ID, model)
+	// a relay's effort family goes as the id of the effort asked
+	// (effort_variants.go); any other model as magpie knows it
+	upstream := provider.UpstreamNameAsIn(wiresOf(r.Context()), p.ID, model, p.SentIDAt(model, sentEffortIf(p, model, proto, body)))
 	body = rewriteModel(body, upstream)
 	if proto == provider.Chat {
 		body = withMistralCacheKey(p, r.Header, body)
@@ -7821,6 +7879,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 		if wrongEndpoint(res.StatusCode, b) {
 			s.markUnfit(p.ID, model, proto)
+			s.markAPI(p.ID, proto, res.StatusCode, b)
 			if len(s.usable(p, model)) > 0 {
 				u.RequestID = "" // another endpoint answers, with its own id
 				return res.StatusCode, msg, false
@@ -7936,6 +7995,15 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	var crArgs *crTidy
 	if (proto == provider.Responses || proto == provider.Chat || proto == provider.Anthropic) && (glmFlash(model) || glmFlash(upstream)) {
 		crArgs = &crTidy{proto: proto, sse: sse}
+	}
+	// a Gemini model's objects of any fields, asked for as JSON text, read
+	// back in its calls (gemini_free_objects.go, #7363); after crArgs,
+	// which drops what would keep the text from parsing
+	var free *freeTidy
+	if (proto == provider.Responses || proto == provider.Chat || proto == provider.Anthropic) && (geminiNamed(model) || geminiNamed(upstream)) {
+		if tools := freeObjectPathsOf(body); len(tools) > 0 {
+			free = &freeTidy{proto: proto, sse: sse, tools: tools}
+		}
 	}
 	// a message the upstream gave no phase gets one, as OpenAI's own
 	// models' do (phase.go, #2437); it goes last, as it holds events back
@@ -8123,6 +8191,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			if crArgs != nil {
 				out = crArgs.write(out)
 			}
+			if free != nil {
+				out = free.write(out)
+			}
 			if made != nil {
 				out = made.write(out)
 			}
@@ -8165,6 +8236,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		if crArgs != nil {
 			b = crArgs.write(b)
 		}
+		if free != nil {
+			b = free.write(b)
+		}
 		if made != nil {
 			b = made.write(b)
 		}
@@ -8204,6 +8278,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	if crArgs != nil {
 		b := crArgs.flush()
+		if free != nil {
+			// free, after crArgs, holds what it can't say yet to its own
+			// drain below
+			b = free.write(b)
+		}
 		if made != nil {
 			// made holds a whole reply until its own drain below, as ints
 			// does: a reply crArgs held to its end goes through it too
@@ -8212,6 +8291,21 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		if ints != nil {
 			// ints holds a whole reply until its own drain below, so the
 			// tail ints has not seen goes through it here first
+			b = ints.write(b)
+		}
+		if sigs != nil {
+			b = sigs.write(b)
+		}
+		write(out(b))
+	}
+	if free != nil {
+		// past crArgs, drained above: what free held goes on through the
+		// filters after it
+		b := free.flush()
+		if made != nil {
+			b = made.write(b)
+		}
+		if ints != nil {
 			b = ints.write(b)
 		}
 		if sigs != nil {
@@ -8384,6 +8478,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			// it: the held end is dropped, the error said in its place,
 			// [DONE] after — no reply that ended as it should with nothing
 			// in it, and no ask again for the budget to burn twice (#2972)
+			if capped <= 0 {
+				s.noteVoid(p, model, sniff.u.Output)
+			}
 			msg := cutVoidFailed(p.Name, capped)
 			dropHalf()
 			w.Write(append(apart(), streamFailure(provider.Chat, msg)...))
@@ -8415,6 +8512,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 		if cutVoid(upstreamStop(heldBody), !sniff.tail.said(), spent, capped) &&
 			replyCheck(r.Context()) == nil {
+			if capped <= 0 {
+				s.noteVoid(p, model, spent)
+			}
 			msg := cutVoidFailed(p.Name, capped)
 			return writeError(w, proto, 502, msg), msg, true
 		}
@@ -8518,6 +8618,18 @@ func eventStream(res *http.Response) (io.Reader, bool) {
 	return br, false
 }
 
+// apiRefused is the unfit mark of an API a provider refused whatever the
+// model (catalog.APIRefused): no model of it is asked there again.
+const apiRefused = "\x01api"
+
+// markAPI marks proto unfit for every model of p when its refusal was of
+// the API itself, not of model on it.
+func (s *Server) markAPI(providerID string, proto provider.Protocol, status int, body []byte) {
+	if catalog.APIRefused(status, body) {
+		s.markUnfit(providerID, apiRefused, proto)
+	}
+}
+
 // fits reports whether the provider hasn't turned model away from proto.
 func (s *Server) fits(providerID, model string, proto provider.Protocol) bool {
 	s.mu.Lock()
@@ -8542,7 +8654,7 @@ func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
 	apis := p.APIs(model)
 	var out []provider.Protocol
 	for _, proto := range p.Speaks() {
-		if s.fits(p.ID, model, proto) && (apis == nil && !p.NamedOnlyOn(proto) || slices.Contains(apis, proto)) {
+		if s.fits(p.ID, model, proto) && s.fits(p.ID, apiRefused, proto) && (apis == nil && !p.NamedOnlyOn(proto) || slices.Contains(apis, proto)) {
 			out = append(out, proto)
 		}
 	}
@@ -8801,7 +8913,9 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 				filledOutput = to != provider.Anthropic
 			}
 		}
-		wire := provider.UpstreamNameIn(wires, p.ID, model)
+		// a relay's effort family goes as the id of the effort the
+		// request was built at (effort_variants.go)
+		wire := provider.UpstreamNameAsIn(wires, p.ID, model, p.SentIDAt(model, req.Effort))
 		sent := req
 		if dropsBillingLine(p, to, model, wire) && billingHeader.MatchString(req.System) {
 			// Claude Code's billing line, which changes every turn, as the
@@ -9184,6 +9298,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			return res, to, nil
 		}
 		s.markUnfit(p.ID, model, to)
+		s.markAPI(p.ID, to, res.StatusCode, b)
 		next := s.usable(p, model)
 		if len(next) == 0 {
 			return res, to, nil
@@ -9786,6 +9901,11 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	// a glm-5.3-flash* replica's CR stitched into a call's arguments
 	// (tool_args_cr.go, #4256)
 	request.CR = glmServed(wiresOf(r.Context()), p, model)
+	// a Gemini model's objects of any fields, sent as JSON text, read
+	// back in its calls (gemini_free_objects.go, #7363)
+	if geminiServed(wiresOf(r.Context()), p, model) {
+		request.Free = freeObjectPaths(request.Tools)
+	}
 	// Grok's reasoning, carried in its calls' ids (reasoning_carry.go)
 	askSealedReasoning(p, from, request)
 	// a model's 2500.0 in a call's arguments, which Codex turns away, is
@@ -9969,7 +10089,12 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		cutVoid(col.res.Stop, !saidAnything(col.res.Parts), col.res.Usage.Output, request.MaxTokens) {
 		// at once, asked again nowhere: a void's budget is spent, and a
 		// second ask at the same max_tokens would mostly spend it twice
-		// over before the error (#2972, its review)
+		// over before the error (#2972, its review). One that named no
+		// limit was cut by the API's own default: the model is asked for
+		// more from now on (noteVoid), this request again by the routing
+		if request.MaxTokens <= 0 {
+			s.noteVoid(p, model, col.res.Usage.Output)
+		}
 		msg := cutVoidFailed(p.Name, request.MaxTokens)
 		return writeError(w, from, 502, msg), msg
 	}
@@ -10413,6 +10538,12 @@ func encoder(proto provider.Protocol, w *sseWriter, r *Request, usage ...*Usage)
 	// integers (grok_integral.go, #1431, #3152), outside usageEncoder,
 	// which reads its encoder's reply id
 	enc = &wholeEncoder{streamEncoder: enc}
+	if len(r.Free) > 0 {
+		// a Gemini model's objects of any fields, which it was asked for
+		// as JSON text, read back (gemini_free_objects.go, #7363); past
+		// crEncoder, which drops what would keep the text from parsing
+		enc = &freeEncoder{streamEncoder: enc, tools: r.Free}
+	}
 	if r.CR {
 		enc = &crEncoder{streamEncoder: enc}
 	}
@@ -10445,6 +10576,7 @@ func render(proto provider.Protocol, res Result, r *Request) []byte {
 	if r.CR {
 		res = crResult(res)
 	}
+	res = freeResult(res, r.Free)
 	res = unfencedResult(res, r)
 	switch proto {
 	case provider.Chat:
@@ -10636,8 +10768,10 @@ func dshCompacts(h http.Header) bool {
 // agent names itself in sessionHeaders is taken.
 const SessionHeader = "X-Magpie-Session"
 
-// AccountHeader pins a request to one of a subscription's accounts, by its
-// user (an email, a login) or its id in the routing trace, percent-encoded
+// AccountHeader pins a request to one of a subscription's accounts or one
+// of a provider's keys, by its user (an email, a login), a key's name, its
+// id in the routing trace, or its stable id as AccountsPath lists it
+// ("<provider>/<id>", pinTargets), percent-encoded
 // when it isn't ASCII (pinnedName): only it is tried, and when it can't take the request the caller is told why rather
 // than another account answering — a probe of one account needs that one.
 // It goes no further than magpie.

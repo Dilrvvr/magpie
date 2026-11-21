@@ -3134,7 +3134,7 @@ magpie.plugin("library", (ctx) => {
     connect.classList.add("lib-hubconnect");
     at.append(glyph(GLYPH.web), aw, copyBtn(hubURL(), t("Address")), connect);
     list.append(at);
-    list.append(hubNoteRow(), hubToolsRow());
+    list.append(hubNoteRow(), hubToolsRow(), hubCodeRow());
     const names = (why) => hubAgents().filter((a) => a.hub === why).map((a) => a.name).join(", ");
     const why = [
       ["no-remote", "{agents} reaches no MCP server over HTTP, so it keeps each server's own entry."],
@@ -3232,6 +3232,23 @@ magpie.plugin("library", (ctx) => {
         if (ok) status(v
           ? t("Agents are given the router's tools on demand — restart them to use it")
           : t("Agents are given every tool of the router — restart them to use it"), "ok");
+      })));
+    return row;
+  }
+  // Code mode: on, the default, the router also gives each agent run_code,
+  // which runs a script calling its tools and gives back only what the
+  // script returns (gateway.hubCodeOn). Off takes it away (settings'
+  // routerNoCode).
+  function hubCodeRow() {
+    const row = el("div", "row lib-row lib-hubcoderow");
+    const who = el("div", "who");
+    who.append(el("div", "name", t("Code mode")));
+    who.append(el("div", "sub wraps", t("Agents can run a short script that calls several tools in one step, and only its result reaches the model.")));
+    row.append(glyph(GLYPH.cmd), who, toggle(lib.hubCode !== false, t("Code mode"), (v) =>
+      change("servers/hub-code", { on: v }).then((ok) => {
+        if (ok) status(v
+          ? t("Agents can run code with the router's tools — restart them to use it")
+          : t("Agents no longer run code with the router's tools — restart them to use it"), "ok");
       })));
     return row;
   }
@@ -3446,6 +3463,17 @@ magpie.plugin("library", (ctx) => {
       const addr = el("div", "lib-hubaddr");
       addr.append(el("code", "", url), copyBtn(url, t("Address")));
       out.push(addr, el("p", "lib-hubcap", t("From another computer, use the address magpie is reached at there, with a gateway key: Authorization: Bearer <key>.")));
+      // the address that gives its tools on demand (gateway.HubOnDemandQuery;
+      // Passings_z on X): which app connects isn't known, so the plain
+      // address gives every tool, and an app that doesn't search its tools
+      // itself asks for them on demand. Only while Tools on demand is on,
+      // since with it off the query changes nothing
+      if (!lib.hubAllTools && lib.hubOnDemandQuery) {
+        const lazy = url + "?" + lib.hubOnDemandQuery;
+        const addr2 = el("div", "lib-hubaddr lib-hubaddr-lazy");
+        addr2.append(el("code", "", lazy), copyBtn(lazy, t("Address")));
+        out.push(addr2, el("p", "lib-hubcap", t("For an app that doesn't search its tools itself: past {n} tools, it is given one that finds a tool and one that runs it.", { n: lib.hubOnDemandOver })));
+      }
       const apps = [
         ...(mcpAgents().some((a) => a.id === "cursor") ? [] : [{ id: "cursor", icon: "cursor", name: "Cursor", link: true, where: t("Or add it to ~/.cursor/mcp.json"), text: json({ mcpServers: { magpie: { url } } }) }]),
         { id: "vscode", icon: "vscode", name: "VS Code", link: true, where: t("Or add it to .vscode/mcp.json, or to your user mcp.json"), text: json({ servers: { magpie: { type: "http", url } } }) },

@@ -1552,6 +1552,15 @@ found skill with a byte copy in another agent shows both agents' icons and
 no "differs in"; one that really differs still says so. Chromium and
 WebKit, in English and Chinese, with `/api/plugins` faked.
 
+`own-skill-all.test.cjs` lists four agents' own skills by the library's
+names (zysicyj on X: ten agents, a click each): the warning's heading has
+one "All agents" menu, whose "Use the library's" and "Keep each agent's
+own" post `skills/use-library-all` and `skills/keep-own-all` with every
+agent's names; Claude Desktop's still stand after "use", with no menu.
+One agent's own Keep says what it did, not the other agents' own skills
+still listed. One agent alone, or a write that failed beside them, gets
+no menu. All five languages, Chromium and WebKit, at 980px and 360px; the API is faked.
+
 `library-sections.test.cjs` hides the Library's tabs from Plugins ›
 Built-in (lantian_x on X): the Library row's Sections link opens a menu of
 the tabs, each ticked; unticking Hooks and Environment variables posts the
@@ -2245,6 +2254,12 @@ window under the meters, broken at a reset, a dashed even burn and a now
 line, the 2 days / Cycle control turning every card without moving the page,
 no curve without readings, the theme's chart colours in light and dark, and
 the tray card's thin current-cycle line, in Chinese and English.
+
+`quota-window-segments.test.cjs` checks that a quota window's figure keeps
+every " · " piece (#7396): a plugin's display with four, a text row, a
+metered window whose display has one of its own, one and two pieces as
+before, no readings, and a narrow window wrapping at a · rather than cut
+short. English and Chinese, Chromium and WebKit, the API faked.
 
 `balance-curve.test.cjs` checks a key's balance over time on the Usage page:
 its readings as a line, the least-squares line since the last top-up dashed

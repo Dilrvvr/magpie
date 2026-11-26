@@ -72,6 +72,11 @@ type modelJSON struct {
 	// Inputs are the media beyond text and images its source listed it
 	// takes, video and audio (catalog.Model.InputModalities; pingqipai3 on X)
 	Inputs []string `json:"inputs,omitempty"`
+	// Maker is the logo of the model's maker, as its id or else its name
+	// says (agent.ModelIcon, what the agents' pickers draw beside it), ""
+	// for one magpie doesn't know: the editor draws its models by maker
+	// (modelorder.js; WJaunita45604 on X)
+	Maker string `json:"maker,omitempty"`
 	// Headers are the request headers the user gave the model, sent after
 	// the provider's (provider.SetModelHeaders)
 	Headers map[string]string `json:"headers,omitempty"`
@@ -323,6 +328,9 @@ type providerJSON struct {
 		Takes bool `json:"takes"`
 		Set   bool `json:"set"`
 	} `json:"balanceToken"`
+	// a key can carry its own account's balance query, where the
+	// provider's token is another account's (provider.KeyBalanceAuth)
+	KeyBalanceAuth bool `json:"keyBalanceAuth,omitempty"`
 	// a StepFun provider's Step Plan windows, told only to a platform
 	// sign-in: which site's, and whether one is kept
 	StepPlan *stepPlanJSON `json:"stepPlan,omitempty"`
@@ -1082,6 +1090,7 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		out.Key.Optional = pr.NoKey
 	}
 	out.BalanceToken.Takes, out.BalanceToken.Set = provider.TakesBalanceToken(p), p.BalanceToken != ""
+	out.KeyBalanceAuth = provider.TakesKeyBalanceAuth(p)
 	if provider.TakesZhipuTeam(p) {
 		out.ZhipuTeam = &provider.ZhipuTeam{}
 		if p.ZhipuTeam != nil {
@@ -1294,6 +1303,9 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		}
 		window := p.WindowIn(m, set)
 		j := modelJSON{ID: m.ID, Name: m.Name, Efforts: provider.EffortsOf(m), On: on, Context: window, Output: provider.OutputWithin(window, p.ReplyLimitIn(m, set)), Listed: provider.ListedWindow(m), ListedOutput: provider.OutputWithin(provider.ListedWindow(m), p.ReplyLimitIn(m, settings.Settings{})), Max: m.MaxContext, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas, Images: images, ImageSet: imageSet, Own: own, Best: newest[m.ID], Inputs: mediaInputs(provider.InputsOf(m))}
+		if j.Maker = agent.ModelIcon(m.ID); j.Maker == "" && m.Name != "" {
+			j.Maker = agent.ModelIcon(m.Name)
+		}
 		list, listed, free := pricer.Prices(set, m.ID)
 		j.Zero = !m.Free && free
 		if j.Keys, j.KeyCount = keysApart(m.Keys, onKeys, keyAt); j.KeyCount == len(j.Keys) {
@@ -1885,6 +1897,17 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				c, ok = gw.RecentCall(id)
 			} else if route, err := strconv.ParseInt(r.URL.Query().Get("route"), 10, 64); err == nil {
 				c, ok = gw.RouteCall(route)
+			}
+			if gateway.HidesRequestText() {
+				// Show request content off (llxth1 on X): the call's
+				// headers while the ring has it, and that its bodies
+				// aren't kept; nor read from the archive here
+				out := map[string]any{"hidden": true}
+				if ok {
+					out["headers"] = c.Headers()
+				}
+				writeJSON(rw, out)
+				return
 			}
 			if ok {
 				writeJSON(rw, map[string]any{
@@ -2767,6 +2790,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					in.AccountNames = old.AccountNames     // with accountname
 					in.KeySpendCaps = old.KeySpendCaps     // with keyspendcap
 					in.KeyOwnBalances = old.KeyOwnBalances // with keyownbalance
+					in.KeyBalanceAuth = old.KeyBalanceAuth // with keys/balance
 				}
 				// the image models unticked in its editor likewise: []
 				// shows them all (321sssrt on X)
@@ -2963,14 +2987,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 						return
 					}
 					if *req.LibraryShared {
-						id := in.ID
-						go func() {
-							ctx, cancel := context.WithTimeout(context.Background(), 2*provider.RemoteLibraryWait)
-							defer cancel()
-							if _, err := library.UseRemoteLibrary(ctx, id); err != nil {
-								log.Printf("library: the Library of %s: %v", id, err)
-							}
-						}()
+						go remoteLibraryRead(in.ID)
 					}
 				}
 			}
@@ -3007,6 +3024,18 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				}
 				wg.Wait()
 				cancel()
+				// a Remote magpie just added with a key that may use all
+				// of it, the user's own hub: its MCP servers, skills and
+				// prompts come with it, unless a switch was set by hand
+				// (starballl on X). After its list, which tells a magpie
+				// that is this one.
+				if req.New && p.IsRemoteMagpie() && (req.LibraryMCP == nil || req.LibraryShared == nil) {
+					ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+					if _, shared := library.AddedRemote(ctx, in.ID, req.LibraryMCP == nil, req.LibraryShared == nil); shared {
+						go remoteLibraryRead(in.ID)
+					}
+					cancel()
+				}
 			}
 			// after the list is fetched: a limit has to name a model it has
 			if req.Outputs != nil {
@@ -3661,6 +3690,10 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			Protocol           provider.Protocol
 			Weight             int
 			Plan               string
+			// a key's own account's balance query (action balance):
+			// a blank token keeps the saved one, Clear drops both
+			Token, User string
+			Clear       bool
 		}
 		var added, had, removed int
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -3701,6 +3734,10 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			err = provider.RenameKey(in.ID, in.Ref, in.Name)
 		case "replace":
 			err = replaceKey(in.ID, in.Ref, in.Key)
+		case "balance":
+			// the access token and user id of the account the key is
+			// of, where it isn't the provider's (key_balance_auth.go)
+			err = provider.SetKeyBalanceAuth(in.ID, in.Ref, in.Token, in.User, in.Clear)
 		case "on", "off":
 			moved, err = agent.Reseat(func() error { return provider.SetKeyOn(in.ID, in.Ref, r.PathValue("action") == "on") })
 		default:
@@ -4413,4 +4450,14 @@ func withdrawnLines() []withdrawnJSON {
 		out = append(out, withdrawnJSON{Withdrawal: w, Beside: insteadOn && w.ID == "antigravity" && provider.AgyHasEvery()})
 	}
 	return out
+}
+
+// remoteLibraryRead reads the Library of the Remote magpie id, its "Use
+// its skills and prompts" switch just turned on; a variable for the tests.
+var remoteLibraryRead = func(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*provider.RemoteLibraryWait)
+	defer cancel()
+	if _, err := library.UseRemoteLibrary(ctx, id); err != nil {
+		log.Printf("library: the Library of %s: %v", id, err)
+	}
 }

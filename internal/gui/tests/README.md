@@ -35,6 +35,13 @@ password, escaped and non-UTF-8 credentials, a login saved in the address
 before loading into the fields, masked addresses/status, clearing
 authentication, Tab and Escape, mode switches, and narrow windows in all
 five languages on Chromium and WebKit.
+
+`agy-usage-reason.test.cjs` checks that agy-cli's own reasons for no quota
+reading this time (sign-in due to be renewed, still reading, too slow, no
+agy, too old) are said in the user's words on the account's row, the Usage
+card and the tray card, and beside a kept reading's "As of" line, in all five
+languages on Chromium and WebKit. The API is faked.
+
 ## Installed desktop fonts
 
 `fonts.test.cjs` exercises the interface/code font controls with installed
@@ -2907,3 +2914,21 @@ is the vendor's in beside the cache columns and with them left out
 (`.led.tight`), and the header says so; with it off, the whole prompt as
 `ledger-in-whole` has it. Every language, 1100 and 390 wide, Chromium and
 WebKit; the API is faked.
+
+## A page whose frames are slow still scrolls
+
+`view-slow-frames.test.cjs` makes every frame take 400ms, the one right
+after a wheel or a lift too, as WebKitGTK drawing the Library's long MCP
+list on a slow Linux machine did (aublurer on X, Omarchy). The wheel still
+moves the Library's MCP list and the Agents page as far as it asks, the
+scrollbar's drag follows the pointer (lifted at once, as WebKit sends its
+scrolls only after the lift), the wheel goes back up once frames are
+fast again, a scroll by code at rest is still put back, and Page Down whose
+own frame takes 600ms (past the 400ms a key's window lasts) still scrolls
+the page, all of WebKit's animated scroll. Every language,
+Chromium and WebKit; the API is faked. `MAGPIE_SLOW_ASSETS` points it at an
+older assets folder, where the wheel leaves the page at 0.
+
+```sh
+node --test internal/gui/tests/view-slow-frames.test.cjs
+```

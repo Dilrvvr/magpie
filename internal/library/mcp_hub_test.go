@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -693,9 +694,18 @@ func TestHubPiDeclaresArtifactsPublish(t *testing.T) {
 	art := fakeStdio(t, "ok", nil)
 	art.Name, art.Args, art.Agents = ArtifactsServerName, []string{"mcp", "artifacts"}, []string{"pi"}
 	ok(t)(SaveServer("", *art))
-	want := map[string]any{"magpie-artifacts__publish_artifact": "direct"}
+	want := map[string]any{"magpie-artifacts__publish_artifact": "direct", "magpie-artifacts__artifact_guide": "direct", "magpie-artifacts__artifact_data": "direct"}
 	if x := exposure(); !reflect.DeepEqual(x, want) {
 		t.Fatalf("toolExposure %v, want %v:\n%s", x, want, read(t, file))
+	}
+	// the publish tool alone, as v0.1.4756 wrote it, is magpie's and grows
+	write(t, file, regexp.MustCompile(`"magpie-artifacts__artifact_(guide|data)": ?"direct", ?`).ReplaceAllString(read(t, file), ``))
+	if x := exposure(); reflect.DeepEqual(x, want) {
+		t.Fatalf("the fixture didn't take the guide out:\n%s", read(t, file))
+	}
+	ok(t)(Sync())
+	if x := exposure(); !reflect.DeepEqual(x, want) {
+		t.Fatalf("after a sync of v0.1.4756's toolExposure: %v:\n%s", x, read(t, file))
 	}
 	// an entry written before has it on the next sync
 	write(t, file, strings.Replace(read(t, file), `"toolExposure"`, `"toolExposureGone"`, 1))
@@ -811,6 +821,45 @@ func TestHubTellsMagpieMemoryItsCaller(t *testing.T) {
 	}
 	if got := hubText(t, res); strings.Contains(got, "meta=") {
 		t.Errorf("another server was told the caller: %q", got)
+	}
+}
+
+// Magpie Artifacts is told the address an agent on another computer
+// reached the hub at (gateway.HubCaller.Base), to give it links there
+// rather than at this computer's 127.0.0.1 (#7890); an agent here is
+// told nothing new, and another server is never told it.
+func TestHubTellsMagpieArtifactsWhereAnAgentAwayIs(t *testing.T) {
+	h := hubSandbox(t)
+	write(t, filepath.Join(h, ".claude.json"), `{"mcpServers": {}}`)
+	art := fakeStdio(t, "ok", nil)
+	art.Name, art.Args, art.Agents = ArtifactsServerName, []string{"mcp", "artifacts"}, []string{"claude"}
+	ok(t)(SaveServer("", *art))
+	other := fakeStdio(t, "ok", nil)
+	other.Agents = []string{"claude"}
+	ok(t)(SaveServer("", *other))
+	ok(t)(SetMCPHub(true))
+	hub := theHub{}
+	ctx := context.Background()
+
+	away := gateway.WithHubCaller(ctx, gateway.HubCaller{Base: "http://magpie:3425", Session: "s"})
+	res, err := hub.Call(away, "claude", ArtifactsServerName, "a", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hubText(t, res); !strings.Contains(got, `meta={"magpie/base":"http://magpie:3425"}`) {
+		t.Errorf("artifacts away called as %q", got)
+	}
+	for _, c := range []struct {
+		ctx    context.Context
+		server string
+	}{{away, "fake"}, {gateway.WithHubCaller(ctx, gateway.HubCaller{Session: "s"}), ArtifactsServerName}, {ctx, ArtifactsServerName}} {
+		res, err := hub.Call(c.ctx, "claude", c.server, "a", json.RawMessage(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hubText(t, res); strings.Contains(got, "meta=") {
+			t.Errorf("%s: called as %q", c.server, got)
+		}
 	}
 }
 

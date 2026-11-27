@@ -7970,6 +7970,8 @@ function proxyPicker() {
 
 // gatewayKeysRow: the gateway keys that may use a saved provider, ticked
 // here as in each key's models (justforlxz on X), by providerkeys.js
+// the account or key each agent uses (nb5p on Discord), in agentaccounts.js
+const agentAccountsRow = (p, at = el("span")) => p?.id && p.agentChoices?.length > 1 ? (import("./agentaccounts.js").then(() => at.isConnected && at.replaceWith(...agentAccountsField(p)), () => {}), [at]) : [];
 function gatewayKeysRow(p) {
   const b = el("button", "rt-cond on gw-keys", "…"), row = p?.id ? field(t("Gateway keys"), b) : [];
   if (p?.id) import("./providerkeys.js").then(() => gatewayKeysFill(p, b, row), () => {});
@@ -9862,7 +9864,7 @@ function drawEditor(p, presetID) {
     const perAccount = subOf(a.agent) ? accountProxyPicker(a, p) : null;
     if (perAccount) proxies.append(perAccount);
     advIn.append(...field(t("Proxy"), proxies));
-    advIn.append(...concurrencyField(p), ...gatewayKeysRow(p));
+    advIn.append(...concurrencyField(p), ...gatewayKeysRow(p), ...agentAccountsRow(p));
     advIn.append(...priceRateField(), ...countFreeField(), ...billingField(), ...rateWindowsField());
     if (p.cline) advIn.append(...upstreamField());
     advIn.append(...unmaskRow(""));
@@ -9915,7 +9917,7 @@ function drawEditor(p, presetID) {
       if (picked === false) return pickError();
       const body = { id: p.id, models: chosenIds(), noModels: noneChosen(), bestInFamily: bestChosen(), unlisted: draft.unlisted, hiddenDrawers: draft.hiddenDrawers, hiddenVideomakers: draft.hiddenVideomakers, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, maxImages, proxy, accountProxies: own.map, maxConcurrency, maxAccounts, ...queue, priceRate, rateWindows, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, unredacted: !!draft.unredacted, countFree: !!draft.countFree, billing: draft.billing || "", ...(p.carriesCompaction ? { nativeCompaction: !!draft.nativeCompaction } : {}), ...routingOfDraft(p) };
       saving(saveBtn, t("Saving…"));
-      saveAccountModelsDraft(picked).then(() => savePluginOptions(subOf(a.agent))).then(() => self.saveGatewayKeys?.(p)).then(() => providerAction("save", body, t("{name} saved", { name: p.name })), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); }); };
+      saveAccountModelsDraft(picked).then(() => savePluginOptions(subOf(a.agent))).then(() => self.saveGatewayKeys?.(p)).then(() => self.saveAgentAccounts?.(p)).then(() => providerAction("save", body, t("{name} saved", { name: p.name })), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); }); };
     bar.append(cancel, saveBtn);
     ed.append(bar);
     return ed;
@@ -10134,7 +10136,7 @@ function drawEditor(p, presetID) {
   const perKey = keyProxyPicker(p);
   if (perKey) proxies.append(perKey);
   advIn.append(...field(t("Proxy"), proxies));
-  advIn.append(...concurrencyField(p), ...gatewayKeysRow(p));
+  advIn.append(...concurrencyField(p), ...gatewayKeysRow(p), ...agentAccountsRow(p));
   advIn.append(...priceRateField(), ...keyRateField(p, "topUpRateField", custom || p?.topUpRate), ...keyRateField(p), ...countFreeField(), ...billingField(), ...rateWindowsField());
 
   if (p?.cline || (isNew && pr?.id === "clinepass")) advIn.append(...upstreamField());
@@ -10693,7 +10695,7 @@ function drawEditor(p, presetID) {
     if (picked === false) return pickError();
     saving(saveBtn, t(isNew ? "Adding…" : "Saving…"));
     const okMsg = t(isNew ? "{name} added" : "{name} saved", { name: draft.name || draft.id });
-    saveAccountModelsDraft(picked).then(() => self.saveGatewayKeys?.(p)).then(() => providerAction("save", body, okMsg), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); });
+    saveAccountModelsDraft(picked).then(() => self.saveGatewayKeys?.(p)).then(() => self.saveAgentAccounts?.(p)).then(() => providerAction("save", body, okMsg), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); });
   };
   saveBtn.onclick = save;
   bar.append(cancel, saveBtn);
@@ -14374,12 +14376,27 @@ function quotaError(err, q) {
   if (/^not read yet: this subscription is switched off/.test(err)) return t("Switched off, so no allowance is read — switch it on and refresh");
   const bal = balanceError(err);
   if (bal) return bal;
+  const agy = agyReason(err);
+  if (agy) return agy;
   // a plugin's own usage read failed: its first line (aqiu817/magpie-sensenova#1)
   if (q?.pluginError) {
     const why = String(err).split("\n")[0].trim();
     if (why) return t("Allowance unavailable: {why}", { why: why.length > 160 ? why.slice(0, 159) + "…" : why });
   }
   return t("Allowance unavailable — hover for why");
+}
+
+// agyReason: why agy-cli's plugin has no reading this time, in its own
+// words (its usage.mjs), said in the user's language; "" for any other.
+// Antigravity's quota showed only this English line, or nothing, an hour
+// after the account's last chat (punk2sang on X)
+function agyReason(err) {
+  if (/^agy's sign-in is due to be renewed/.test(err)) return t("agy renews this account's sign-in on its next chat, and reads its allowance after that");
+  if (/^agy is still reading this account's quota/.test(err)) return t("agy is still reading this allowance — it shows on the next refresh");
+  if (/^agy(?:'s own usage read didn't finish| didn't say its version) in/.test(err)) return t("agy took too long to read its usage — it is asked again soon; if this stays, check agy's network or proxy");
+  if (/^agy CLI not found/.test(err)) return t("agy isn't installed — sign in to this account again in magpie to install it");
+  if (/^agy usage reports require a verified agy version/.test(err)) return t("agy is too old to tell its usage — update Antigravity CLI");
+  return "";
 }
 
 // the Balance field's placeholder (balancePathOf in balance.go)
@@ -15724,7 +15741,7 @@ function scrollCloses(box, e) {
   // a box scrolling its own text (a long one goes back to its start as it
   // loses focus to the click that opened the menu) moves nothing
   if (e.target.matches?.("input, textarea")) return false;
-  return !e.target.classList?.contains("view") || performance.now() < purposeUntil && purposeUntil !== guardUntil;
+  return !e.target.classList?.contains("view") || readerTurn() && purposeUntil !== guardUntil;
 }
 // openProtoMenu picks one of opts, or several when value is a list (ticked
 // in turn, menu kept open; live: choose after each tick).
@@ -15824,7 +15841,7 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
   // A live pick can shrink the list or wrap its heading and clamp the scroll.
   // Only the reader's scroll dismisses it; the click guard holds its anchor.
   const scroll = (e) => {
-    if (box.contains(e.target) || live && performance.now() >= purposeUntil) return;
+    if (box.contains(e.target) || live && !readerTurn()) return;
     if (scrollCloses(box, e)) closeProtoMenu();
   };
   const keys = (e) => {
@@ -18077,7 +18094,7 @@ function panelBalances(bals) {
 function asOfText(q, short = false) {
   const text = short ? t("As of {when}", { when: stamp(q.asOf) })
     : t(q.readDeferred ? "As of {when} — not refreshed this time" : "As of {when} — couldn't be read just now", { when: new Date(q.asOf).toLocaleString(intlLang()) })
-      + (!q.readDeferred && q.readError ? " · " + q.readError : "");
+      + (!q.readDeferred && q.readError ? " · " + (agyReason(q.readError) || q.readError) : "");
   return q.windows?.some((w) => w.resetsAt && new Date(w.resetsAt).getTime() <= Date.now())
     ? text + " · " + t("A cached window has expired; current allowance is unknown") : text;
 }
@@ -19900,8 +19917,9 @@ function applyPrefs(s, rate) {
     // tooltip says which mode it was drawn in
     for (const b of document.querySelectorAll(".quota-curve:not(.balance-curve)")) b.title = quotaCurveTitle();
   }
-  // an accent or picture of the user's own (appearance.go), when not the one drawn
-  const look = (s.accent || "") + "," + (s.wallpaper || "");
+  // an accent, picture or contrast of the user's own (appearance.go), when not the one drawn;
+  // lookKey's "accent,stampcontrast", an unset one "" as an array joins it
+  const look = [s.accent, s.wallpaper] + [s.contrast];
   if (look !== (applyPrefs.look ??= window.bootPrefs?.look ?? ",")) applyPrefs.look = look, import("./appearance.js").then(() => lookPaint(), () => {});
   applyPrefs.ready = true;
   // a browser tab's title names this magpie (Settings' Name, else
@@ -23029,7 +23047,22 @@ let purposeUntil = 0, held = null;
 // field brought back into sight, backToReader): it lets that scroll stand,
 // but it isn't the reader's, so an app menu the click opens stays open.
 let guardUntil = 0;
-const readerScrolls = (ms) => { quotaFocus = ""; purposeUntil = Math.max(purposeUntil, performance.now() + ms); held = null; guardUntil = 0; };
+// A window the reader's input opens lasts its time or the next FRAMES frames
+// drawn, whichever ends later (up to 2s): a scroll is heard at the frame
+// after it, and where a frame takes longer than the window (WebKitGTK
+// drawing a long page on Linux, a busy machine), every scroll a wheel or a
+// bar's drag made came after it and was put back, so the Library's MCP list
+// barely moved (aublurer on X, Omarchy). Frames are counted only while a
+// window is open.
+const FRAMES = 3, FRAMES_MS = 2000, SHUT = { n: 0, cap: 0 };
+let frameNo = 0, counting = false, purposeFrames = SHUT, flingFrames = SHUT;
+const frameWin = () => ({ n: frameNo + FRAMES, cap: performance.now() + FRAMES_MS });
+const frameOpen = (w) => frameNo < w.n && performance.now() < w.cap;
+const frameTicks = () => { frameNo++; counting = frameOpen(purposeFrames) || frameOpen(flingFrames); if (counting) requestAnimationFrame(frameTicks); };
+const countFrames = () => { if (!counting) { counting = true; requestAnimationFrame(frameTicks); } };
+// the reader's window is open: their scroll is theirs
+const readerTurn = () => performance.now() < purposeUntil || frameOpen(purposeFrames);
+const readerScrolls = (ms) => { quotaFocus = ""; purposeUntil = Math.max(purposeUntil, performance.now() + ms); purposeFrames = frameWin(); countFrames(); held = null; guardUntil = 0; };
 function scrollOnPurpose(e, ms = 1000) {
   if (!e?.isTrusted || performance.now() - e.timeStamp > 1000) {
     console.warn("magpie: a scroll not asked for by the reader was refused");
@@ -23043,7 +23076,7 @@ function scrollOnPurpose(e, ms = 1000) {
 // the view up while it is drawn) is put back there, not taken as theirs.
 function arrived(v) {
   readerLeaves(v);
-  purposeUntil = performance.now();
+  purposeUntil = performance.now(); purposeFrames = SHUT;
 }
 const SCROLL_KEYS = new Set(["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown", " "]);
 // Enter/Space can move focus to another field (opening a form, or validation).
@@ -23091,7 +23124,7 @@ function waitsBack(v) {
   clearTimeout(w?.t); waits.delete(v);
   if (w?.d === d && w.h === v.scrollHeight && performance.now() - w.at < 80) { readerWay.set(v, d); readerLeaves(v); flings(); return true; }
   const h = v.scrollHeight;
-  waits.set(v, { d, h, at: performance.now(), t: setTimeout(() => { waits.delete(v); if (d > 0 && h === v.scrollHeight && v.scrollTop + v.clientHeight >= h - 1) { readerWay.set(v, d); readerLeaves(v); } else if (performance.now() >= purposeUntil && held?.v !== v) { const from = v.scrollTop; backToReader(v); puttingBack(v, from, false); } }, 120) });
+  waits.set(v, { d, h, at: performance.now(), t: setTimeout(() => { waits.delete(v); if (d > 0 && h === v.scrollHeight && v.scrollTop + v.clientHeight >= h - 1) { readerWay.set(v, d); readerLeaves(v); } else if (!readerTurn() && held?.v !== v) { const from = v.scrollTop; backToReader(v); puttingBack(v, from, false); } }, 120) });
   return true;
 }
 // Given back is what was put back after the reader's input was made (its
@@ -23123,9 +23156,9 @@ addEventListener("touchmove", (e) => {
 // so: each of their scrolls keeps the next one the reader's till it rests.
 // Put back, the page shook (jiakun_zhao on X: 滚动会抽搐; issenn: 高频振动并复位).
 let flingUntil = 0;
-const flings = () => { flingUntil = performance.now() + 250; readerScrolls(250); };
+const flings = () => { flingUntil = performance.now() + 250; flingFrames = frameWin(); readerScrolls(250); };
 addEventListener("touchend", flings, { capture: true, passive: true });
-addEventListener("scroll", () => { if (performance.now() < flingUntil) flings(); }, { capture: true, passive: true });
+addEventListener("scroll", () => { if (performance.now() < flingUntil || frameOpen(flingFrames)) flings(); }, { capture: true, passive: true });
 // a drag, not the tremble of a click
 let downAt = null;
 // A scrollbar drag is the reader's, but Chromium and WebView2 send no
@@ -23176,6 +23209,10 @@ addEventListener("blur", panEnds);
 addEventListener("keydown", (e) => {
   panEnds();
   const typing = e.target.closest?.("input, textarea, select, [contenteditable]");
+  // WebKit plays a key's scroll over frames, as it plays a coast: past a slow
+  // frame at the key the rest were put back (aublurer on X), so its scrolls
+  // keep the next one the reader's, as a fling's do
+  if (!typing && SCROLL_KEYS.has(e.key)) { flingUntil = Math.max(flingUntil, performance.now() + 400); flingFrames = frameWin(); }
   if (e.key === "Tab" || (!typing && SCROLL_KEYS.has(e.key))) readerScrolls(400);
   if (e.isTrusted && e.key === "Enter") keyboardFocus(e);
 }, true);
@@ -23224,7 +23261,7 @@ function pinnedAt(v) {
 // as soon as what's above it has changed size, before the reader sees it
 // (followPin; a part redrawn or moved with nothing changing size calls it)
 function followPin(v) {
-  if (pinOf.has(v) && (!pinOnly.has(v) || pinAt.get(v)) && !v.hidden && held?.v !== v && performance.now() >= purposeUntil) backToReader(v);
+  if (pinOf.has(v) && (!pinOnly.has(v) || pinAt.get(v)) && !v.hidden && held?.v !== v && !readerTurn()) backToReader(v);
 }
 const pinSizes = new ResizeObserver(() => { for (const v of pinOf.keys()) followPin(v); });
 function backToReader(v) {
@@ -23252,7 +23289,7 @@ function backToReader(v) {
 const readerWay = new WeakMap();
 function backAfterLoad(v) {
   const at = readerAt.get(v);
-  if (!v.hidden && (barDrag === v || performance.now() < purposeUntil && at != null && readerWay.get(v) === Math.sign(Math.round(v.scrollTop - at)))) readerLeaves(v);
+  if (!v.hidden && (barDrag === v || readerTurn() && at != null && readerWay.get(v) === Math.sign(Math.round(v.scrollTop - at)))) readerLeaves(v);
   else backToReader(v);
 }
 // Where an element is on the screen in its view. What's held is the element
@@ -23361,7 +23398,7 @@ let relaidUntil = 0;
 const relaid = new ResizeObserver(() => {
   if (performance.now() > relaidUntil) { relaid.disconnect(); return; }
   const v = $("#view-" + view);
-  if (v && !v.hidden && !held && performance.now() >= purposeUntil) backToReader(v);
+  if (v && !v.hidden && !held && !readerTurn()) backToReader(v);
 });
 addEventListener("resize", () => {
   if (innerWidth === heldWidth) return;
@@ -23388,9 +23425,9 @@ function keepHeld() {
   requestAnimationFrame(keepHeld);
 }
 addEventListener("click", (e) => {
-  const readers = performance.now() < purposeUntil;
+  const readers = readerTurn();
   // what came before the click (Space pressed on a button, a tremble, the lift of a tap) is no scroll
-  purposeUntil = flingUntil = 0;
+  purposeUntil = flingUntil = 0; purposeFrames = flingFrames = SHUT;
   // a pick in a menu (in body, outside any view) is a click on the pill that
   // opened it: what it changes comes in around that pill, which stays put (#961)
   const at = protoMenu?.box.contains(e.target) ? protoMenu.anchor : e.target;
@@ -23415,7 +23452,7 @@ for (const v of document.querySelectorAll(".view")) {
   v.addEventListener("scroll", () => {
     if (v.hidden) return;
     if (panning?.v === v) readerScrolls(250);
-    if (performance.now() < purposeUntil || barDrag === v) {
+    if (readerTurn() || barDrag === v) {
       const by = v.scrollTop - (readerAt.get(v) ?? v.scrollTop);
       if (Math.abs(by) >= 1) readerWay.set(v, Math.sign(by));
       fitRoom(v); readerLeaves(v); scrolledFrom.set(v, document.activeElement); return;
